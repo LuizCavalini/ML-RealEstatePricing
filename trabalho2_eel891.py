@@ -12,7 +12,9 @@ por RMSPE, com e sem outliers (secoes 24-27) + otimizacao de
 hiperparametros com Optuna para LightGBM/XGBoost/CatBoost (secoes 28-32) +
 ensemble (voting e blend multi-seed) e geracao da submissao (secoes 33-38) +
 iteracao/melhorias pos-Kaggle: encoding de bairro, features de interacao e
-corte de outliers mais agressivo, com novas submissoes (secoes 39-42).
+corte de outliers mais agressivo, com novas submissoes (secoes 39-42) +
+segunda rodada: re-otimizacao Optuna no dataset v4, weighted blending e
+features extras do texto 'diferenciais' (secoes 43-46).
 """
 
 import json
@@ -401,6 +403,42 @@ print("n_palavras_diferenciais - estatisticas:")
 print(dados["n_palavras_diferenciais"].describe())
 print("\ntem_diferenciais - contagem:")
 print(dados["tem_diferenciais"].value_counts())
+
+PALAVRAS_LUXO = [
+    "gourmet", "designer", "marmore", "granito", "porcelanato", "reformado",
+    "novo", "andar alto", "sol da manha", "varanda",
+]
+
+
+def extrair_features_texto_luxo(serie_diferenciais):
+    """n_chars_diferenciais, n_keywords_luxo e tem_keyword_luxo a partir do texto livre.
+
+    Definida aqui (antes de remover 'diferenciais') mas reutilizada mais tarde, na secao 45
+    (Melhoria 6), diretamente sobre treino/teste originais -- evita ter que manter um DataFrame
+    auxiliar alinhado por indice ao longo de todo o pre-processamento/tratamento de outliers.
+    """
+    texto = serie_diferenciais.fillna("")
+    n_keywords = pd.Series(0, index=serie_diferenciais.index)
+    for palavra in PALAVRAS_LUXO:
+        n_keywords = n_keywords + texto.str.contains(palavra, case=False, na=False).astype(int)
+    return pd.DataFrame(
+        {
+            "n_chars_diferenciais": texto.str.len(),
+            "n_keywords_luxo": n_keywords,
+            "tem_keyword_luxo": (n_keywords > 0).astype(int),
+        }
+    )
+
+
+# Preview das features extras do texto (usadas na Melhoria 6, secao 45). Mantidas FORA de
+# 'dados' de proposito -- assim X_train/X_test continuam sem elas ate a melhoria 6 testar
+# explicitamente se ajudam, numa comparacao limpa "com vs sem".
+preview_features_luxo = extrair_features_texto_luxo(dados["diferenciais"])
+print("\nFeatures extras do texto (preview, reservadas para a Melhoria 6, secao 45):")
+print(preview_features_luxo.describe())
+if (preview_features_luxo["n_keywords_luxo"] == 0).all():
+    print("\nNota: nenhuma das palavras-chave de luxo aparece no vocabulario de 'diferenciais' -- a")
+    print("coluna e uma combinacao fixa das 10 amenidades (+ 'esquina'/'copa'), sem texto livre real.")
 
 dados = dados.drop(columns=["diferenciais"])
 print("\nColuna 'diferenciais' removida (as 10 binarias ja capturam a informacao, ver secao 10).")
@@ -1343,3 +1381,338 @@ print("\nResumo de todas as tentativas:")
 print(tab_tentativas.to_string(index=False))
 
 print("\nIteracao de melhorias concluida.")
+
+
+# ---------------------------------------------------------------------------
+# 43. Melhoria 4 - Re-otimizar Optuna no dataset v4
+# ---------------------------------------------------------------------------
+secao("43. MELHORIA 4 - RE-OTIMIZAR OPTUNA NO DATASET V4")
+
+print("Dataset v4: TE smoothed+freq (melhoria 1) + features de interacao (melhoria 2) + corte p99 (melhoria 3).")
+print(f"Shape do treino v4: {X_train_melhoria3.shape}")
+
+# 2. Novo split 80/20 estratificado (mesmo esquema da secao 28), agora sobre o dataset v4.
+# Reatribuir as globais usadas por avaliar_rmspe_val() e pelas funcoes objetivo_* (secoes 29-31)
+# reaproveita o MESMO codigo de otimizacao, so que apontando para os dados do dataset v4 --
+# nada nessas funcoes ja foi usado de novo ate aqui, entao a reatribuicao e segura.
+bins_estratificacao_v4 = pd.qcut(y_train_melhoria3, q=5, labels=False)
+X_opt_treino, X_opt_val, y_opt_treino, y_opt_val = train_test_split(
+    X_train_melhoria3, y_train_melhoria3, test_size=0.2, random_state=42, stratify=bins_estratificacao_v4
+)
+print(f"Split 80/20 estratificado (dataset v4): treino={X_opt_treino.shape}  validacao={X_opt_val.shape}")
+
+# 3. Optuna: LightGBM (50), XGBoost (50), CatBoost (30) -- mesmas funcoes objetivo das secoes 29-31
+print("\nRe-otimizando LightGBM (50 trials)...")
+study_lgbm_v4 = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_lgbm_v4.optimize(objetivo_lgbm, n_trials=50, show_progress_bar=True)
+print(f"Melhor RMSPE (validacao) - LightGBM v4: {study_lgbm_v4.best_value:.4f}")
+
+print("\nRe-otimizando XGBoost (50 trials)...")
+study_xgb_v4 = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_xgb_v4.optimize(objetivo_xgb, n_trials=50, show_progress_bar=True)
+print(f"Melhor RMSPE (validacao) - XGBoost v4: {study_xgb_v4.best_value:.4f}")
+
+print("\nRe-otimizando CatBoost (30 trials)...")
+study_catboost_v4 = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_catboost_v4.optimize(objetivo_catboost, n_trials=30, show_progress_bar=True)
+print(f"Melhor RMSPE (validacao) - CatBoost v4: {study_catboost_v4.best_value:.4f}")
+
+# 4. Comparar RMSPE: params antigos (secao 32/33) vs params novos, 5-fold CV no dataset v4
+print("\nComparando params antigos vs novos (5-fold CV, dataset v4), por modelo:")
+
+resultados_v4_tuning = []
+for nome, modelo_cls, params_antigos, params_novos, seed_kw in [
+    ("LGBMRegressor", LGBMRegressor, params_lgbm, study_lgbm_v4.best_params, {"random_state": 42, "verbose": -1}),
+    ("XGBRegressor", XGBRegressor, params_xgb, study_xgb_v4.best_params, {"random_state": 42, "verbosity": 0}),
+    ("CatBoostRegressor", CatBoostRegressor, params_catboost, study_catboost_v4.best_params, {"random_seed": 42, "verbose": 0}),
+]:
+    scores_antigo = -cross_val_score(
+        modelo_cls(**params_antigos, **seed_kw), X_train_melhoria3, y_train_melhoria3,
+        cv=kf, scoring=rmspe_scorer, n_jobs=1,
+    )
+    scores_novo = -cross_val_score(
+        modelo_cls(**params_novos, **seed_kw), X_train_melhoria3, y_train_melhoria3,
+        cv=kf, scoring=rmspe_scorer, n_jobs=1,
+    )
+    melhora_modelo = bool(scores_novo.mean() < scores_antigo.mean())
+    resultados_v4_tuning.append(
+        {
+            "modelo": nome,
+            "rmspe_params_antigos": scores_antigo.mean(),
+            "rmspe_params_novos": scores_novo.mean(),
+            "melhorou": melhora_modelo,
+        }
+    )
+    print(
+        f"{nome:20s} antigos={scores_antigo.mean():.4f}  novos={scores_novo.mean():.4f}  "
+        f"melhorou={melhora_modelo}"
+    )
+
+tab_v4_tuning = pd.DataFrame(resultados_v4_tuning)
+print("\nComparacao params antigos vs novos (dataset v4):")
+print(tab_v4_tuning.to_string(index=False))
+
+
+def escolher_params(nome_modelo, params_antigos, params_novos):
+    melhorou = tab_v4_tuning.loc[tab_v4_tuning["modelo"] == nome_modelo, "melhorou"].iloc[0]
+    return params_novos if melhorou else params_antigos
+
+
+# 5. Params finais por modelo (novos se melhoraram, senao mantem os antigos)
+params_lgbm_final = escolher_params("LGBMRegressor", params_lgbm, study_lgbm_v4.best_params)
+params_xgb_final = escolher_params("XGBRegressor", params_xgb, study_xgb_v4.best_params)
+params_catboost_final = escolher_params("CatBoostRegressor", params_catboost, study_catboost_v4.best_params)
+
+# Veredito agregado (voting ensemble, 3 modelos) no dataset v4: params antigos vs escolhidos
+print("\nVeredito agregado -- voting ensemble (3 modelos) no dataset v4:")
+
+
+def cv_rmspe_voting(criar_modelos_fn, X, y):
+    """5-fold CV do voting ensemble; criar_modelos_fn() retorna um dict fresco {nome: modelo}."""
+    scores_fold = []
+    for idx_tr, idx_val in kf.split(X):
+        X_tr, X_val = X.iloc[idx_tr], X.iloc[idx_val]
+        y_tr, y_val = y.iloc[idx_tr], y.iloc[idx_val]
+        preds = []
+        for modelo in criar_modelos_fn().values():
+            modelo.fit(X_tr, y_tr)
+            preds.append(modelo.predict(X_val))
+        pred_media = np.mean(preds, axis=0)
+        scores_fold.append(rmspe(y_val, pred_media))
+    return np.array(scores_fold)
+
+
+def criar_modelos_antigos():
+    return {
+        "LGBMRegressor": LGBMRegressor(**params_lgbm, random_state=42, verbose=-1),
+        "XGBRegressor": XGBRegressor(**params_xgb, random_state=42, verbosity=0),
+        "CatBoostRegressor": CatBoostRegressor(**params_catboost, random_seed=42, verbose=0),
+    }
+
+
+def criar_modelos_novos():
+    return {
+        "LGBMRegressor": LGBMRegressor(**params_lgbm_final, random_state=42, verbose=-1),
+        "XGBRegressor": XGBRegressor(**params_xgb_final, random_state=42, verbosity=0),
+        "CatBoostRegressor": CatBoostRegressor(**params_catboost_final, random_seed=42, verbose=0),
+    }
+
+
+scores_voting_antigo_v4 = cv_rmspe_voting(criar_modelos_antigos, X_train_melhoria3, y_train_melhoria3)
+scores_voting_novo_v4 = cv_rmspe_voting(criar_modelos_novos, X_train_melhoria3, y_train_melhoria3)
+
+print(f"Params antigos: RMSPE = {scores_voting_antigo_v4.mean():.4f} +/- {scores_voting_antigo_v4.std():.4f}")
+print(f"Params novos  : RMSPE = {scores_voting_novo_v4.mean():.4f} +/- {scores_voting_novo_v4.std():.4f}")
+
+melhorou_melhoria4 = bool(scores_voting_novo_v4.mean() < scores_voting_antigo_v4.mean())
+print(f"\nMelhoria 4 {'MELHOROU' if melhorou_melhoria4 else 'NAO melhorou'} o RMSPE (voting ensemble, dataset v4).")
+
+if melhorou_melhoria4:
+    rmspe_melhoria4, std_melhoria4 = float(scores_voting_novo_v4.mean()), float(scores_voting_novo_v4.std())
+else:
+    # Nao melhorou -- os params "finais" seguem sendo os antigos para as proximas secoes
+    params_lgbm_final, params_xgb_final, params_catboost_final = params_lgbm, params_xgb, params_catboost
+    rmspe_melhoria4, std_melhoria4 = float(scores_voting_antigo_v4.mean()), float(scores_voting_antigo_v4.std())
+
+
+# ---------------------------------------------------------------------------
+# 44. Melhoria 5 - Weighted blending
+# ---------------------------------------------------------------------------
+secao("44. MELHORIA 5 - WEIGHTED BLENDING")
+
+
+def criar_modelos_finais():
+    return {
+        "LGBMRegressor": LGBMRegressor(**params_lgbm_final, random_state=42, verbose=-1),
+        "XGBRegressor": XGBRegressor(**params_xgb_final, random_state=42, verbosity=0),
+        "CatBoostRegressor": CatBoostRegressor(**params_catboost_final, random_seed=42, verbose=0),
+    }
+
+
+# 1. RMSPE individual de cada modelo (5-fold CV, dataset v4, params finais da melhoria 4)
+rmspe_individuais = {}
+for nome, modelo in criar_modelos_finais().items():
+    scores = -cross_val_score(
+        modelo, X_train_melhoria3, y_train_melhoria3, cv=kf, scoring=rmspe_scorer, n_jobs=1
+    )
+    rmspe_individuais[nome] = float(scores.mean())
+    print(f"{nome:20s} RMSPE individual = {rmspe_individuais[nome]:.4f}")
+
+# 2. Pesos inversamente proporcionais ao RMSPE
+inv_rmspe = {nome: 1.0 / v for nome, v in rmspe_individuais.items()}
+soma_inv = sum(inv_rmspe.values())
+pesos = {nome: v / soma_inv for nome, v in inv_rmspe.items()}
+print("\nPesos do blend (inversamente proporcionais ao RMSPE):")
+for nome, peso in pesos.items():
+    print(f"  {nome:20s} peso = {peso:.4f}")
+
+# 3-4. Blend uniforme vs blend pesado (5-fold CV manual, dataset v4, pesos fixos definidos acima)
+scores_uniforme_fold = []
+scores_pesado_fold = []
+for idx_tr, idx_val in kf.split(X_train_melhoria3):
+    X_tr = X_train_melhoria3.iloc[idx_tr]
+    X_val = X_train_melhoria3.iloc[idx_val]
+    y_tr = y_train_melhoria3.iloc[idx_tr]
+    y_val = y_train_melhoria3.iloc[idx_val]
+
+    preds = {}
+    for nome, modelo in criar_modelos_finais().items():
+        modelo.fit(X_tr, y_tr)
+        preds[nome] = modelo.predict(X_val)
+
+    pred_uniforme = np.mean(list(preds.values()), axis=0)
+    pred_pesado = sum(pesos[nome] * preds[nome] for nome in preds)
+
+    scores_uniforme_fold.append(rmspe(y_val, pred_uniforme))
+    scores_pesado_fold.append(rmspe(y_val, pred_pesado))
+
+scores_uniforme_fold = np.array(scores_uniforme_fold)
+scores_pesado_fold = np.array(scores_pesado_fold)
+
+print(f"\nBlend uniforme: RMSPE = {scores_uniforme_fold.mean():.4f} +/- {scores_uniforme_fold.std():.4f}")
+print(f"Blend pesado:   RMSPE = {scores_pesado_fold.mean():.4f} +/- {scores_pesado_fold.std():.4f}")
+
+melhorou_melhoria5 = bool(scores_pesado_fold.mean() < scores_uniforme_fold.mean())
+print(f"\nMelhoria 5 {'MELHOROU' if melhorou_melhoria5 else 'NAO melhorou'} o RMSPE (blend pesado vs uniforme).")
+
+if melhorou_melhoria5:
+    rmspe_melhoria5, std_melhoria5 = float(scores_pesado_fold.mean()), float(scores_pesado_fold.std())
+else:
+    rmspe_melhoria5, std_melhoria5 = float(scores_uniforme_fold.mean()), float(scores_uniforme_fold.std())
+
+
+# ---------------------------------------------------------------------------
+# 45. Melhoria 6 - Features extras do texto 'diferenciais'
+# ---------------------------------------------------------------------------
+secao("45. MELHORIA 6 - FEATURES EXTRAS DO TEXTO 'diferenciais'")
+
+# Recalculadas direto de treino/teste originais (nunca modificados) -- evita depender de
+# alinhamento por indice atraves de todo o pre-processamento/outliers ja aplicados.
+features_luxo_treino = extrair_features_texto_luxo(treino.loc[idx_treino_limpo, "diferenciais"]).reset_index(drop=True)
+features_luxo_teste = extrair_features_texto_luxo(teste["diferenciais"]).reset_index(drop=True)
+
+# Mesmo corte de linhas do dataset v4 (melhoria 3 so remove linhas, nao muda a ordem)
+if melhorou_melhoria3:
+    features_luxo_treino_v4 = features_luxo_treino.loc[mask_p99.values].reset_index(drop=True)
+else:
+    features_luxo_treino_v4 = features_luxo_treino
+
+X_train_m6_base = X_train_melhoria3
+X_test_m6_base = X_test_melhoria2
+y_train_m6 = y_train_melhoria3
+
+X_train_m6_extra = pd.concat(
+    [X_train_m6_base.reset_index(drop=True), features_luxo_treino_v4.reset_index(drop=True)], axis=1
+)
+X_test_m6_extra = pd.concat(
+    [X_test_m6_base.reset_index(drop=True), features_luxo_teste.reset_index(drop=True)], axis=1
+)
+
+
+def cv_rmspe_catboost_final(X, y):
+    scores = cross_val_score(
+        CatBoostRegressor(**params_catboost_final, random_seed=42, verbose=0),
+        X, y, cv=kf, scoring=rmspe_scorer, n_jobs=1,
+    )
+    return -scores
+
+
+scores_m6_base = cv_rmspe_catboost_final(X_train_m6_base, y_train_m6)
+scores_m6_extra = cv_rmspe_catboost_final(X_train_m6_extra, y_train_m6)
+
+print(f"Base (dataset v4, sem features de texto):        RMSPE = {scores_m6_base.mean():.4f} +/- {scores_m6_base.std():.4f}")
+print(f"Com features extras de texto (chars/keywords):   RMSPE = {scores_m6_extra.mean():.4f} +/- {scores_m6_extra.std():.4f}")
+
+melhorou_melhoria6 = bool(scores_m6_extra.mean() < scores_m6_base.mean())
+print(f"\nMelhoria 6 {'MELHOROU' if melhorou_melhoria6 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria6:
+    X_train_final, X_test_final = X_train_m6_extra, X_test_m6_extra
+    rmspe_melhoria6, std_melhoria6 = float(scores_m6_extra.mean()), float(scores_m6_extra.std())
+else:
+    X_train_final, X_test_final = X_train_m6_base, X_test_m6_base
+    rmspe_melhoria6, std_melhoria6 = float(scores_m6_base.mean()), float(scores_m6_base.std())
+
+
+# ---------------------------------------------------------------------------
+# 46. Gerar novas submissoes e resumo final
+# ---------------------------------------------------------------------------
+secao("46. GERAR NOVAS SUBMISSOES E RESUMO FINAL")
+
+
+def gerar_submissao_blend_v2(X_tr, y_tr, X_te, nome_arquivo, params_lgbm_uso, params_xgb_uso, params_catboost_uso, pesos_uso=None):
+    """Blend de 5 seeds x 3 modelos, com params e (opcionalmente) pesos customizados."""
+    previsoes = {"LGBMRegressor": [], "XGBRegressor": [], "CatBoostRegressor": []}
+    for seed in seeds_submissao:
+        modelos_seed = {
+            "LGBMRegressor": LGBMRegressor(**params_lgbm_uso, random_state=seed, verbose=-1),
+            "XGBRegressor": XGBRegressor(**params_xgb_uso, random_state=seed, verbosity=0),
+            "CatBoostRegressor": CatBoostRegressor(**params_catboost_uso, random_seed=seed, verbose=0),
+        }
+        for nome, modelo in modelos_seed.items():
+            modelo.fit(X_tr, y_tr)
+            previsoes[nome].append(modelo.predict(X_te))
+
+    if pesos_uso is None:
+        todas_previsoes = [p for lista in previsoes.values() for p in lista]
+        pred_log_media = np.mean(todas_previsoes, axis=0)
+    else:
+        medias_por_modelo = {nome: np.mean(lista, axis=0) for nome, lista in previsoes.items()}
+        pred_log_media = sum(pesos_uso[nome] * medias_por_modelo[nome] for nome in medias_por_modelo)
+
+    preco_pred = np.clip(np.expm1(pred_log_media), PRECO_MINIMO, None)
+    sub = pd.DataFrame({"Id": test_ids, "preco": preco_pred})
+    sub.to_csv(nome_arquivo, index=False)
+    print(f"Submissao salva em '{nome_arquivo}' ({len(sub)} linhas).")
+    return sub
+
+
+nova_rodada = []
+
+# v5: efeito isolado do re-optuna (melhoria 4) -- dataset v4, blend uniforme
+if melhorou_melhoria4:
+    gerar_submissao_blend_v2(
+        X_train_melhoria3, y_train_melhoria3, X_test_melhoria2,
+        "submissao_v5.csv", params_lgbm_final, params_xgb_final, params_catboost_final,
+    )
+    arquivo_v5 = "submissao_v5.csv"
+else:
+    print("Melhoria 4 (re-optuna) nao melhorou -- 'submissao_v5.csv' NAO gerada.")
+    arquivo_v5 = None
+nova_rodada.append(
+    {"versao": "v5 (melhoria 4: re-optuna no dataset v4)", "rmspe_cv": rmspe_melhoria4, "melhorou": melhorou_melhoria4, "arquivo": arquivo_v5}
+)
+
+# v6: melhor combinacao cumulativa (params da melhoria 4 + pesos da melhoria 5, se ajudou +
+# features de texto da melhoria 6, se ajudou)
+alguma_melhoria_5_ou_6 = melhorou_melhoria5 or melhorou_melhoria6
+gerar_v6 = melhorou_melhoria4 or alguma_melhoria_5_ou_6
+if gerar_v6:
+    pesos_finais = pesos if melhorou_melhoria5 else None
+    gerar_submissao_blend_v2(
+        X_train_final, y_train_m6, X_test_final,
+        "submissao_v6.csv", params_lgbm_final, params_xgb_final, params_catboost_final,
+        pesos_uso=pesos_finais,
+    )
+    arquivo_v6 = "submissao_v6.csv"
+else:
+    print("Nenhuma melhoria adicional (4, 5 ou 6) sobre o dataset v4 -- 'submissao_v6.csv' NAO gerada.")
+    arquivo_v6 = None
+nova_rodada.append(
+    {"versao": "v6 (melhor combo: melhorias 4+5+6)", "rmspe_cv": rmspe_melhoria6, "melhorou": gerar_v6, "arquivo": arquivo_v6}
+)
+
+tab_nova_rodada = pd.DataFrame(nova_rodada)
+print("\nResumo desta rodada (melhorias 4-6):")
+print(tab_nova_rodada.to_string(index=False))
+
+print("\nNota sobre as metricas: v1-v4 e v5 (agregado) usam RMSPE do voting ensemble (3 modelos);")
+print("as comparacoes internas das melhorias 1, 2, 3 e 6 usam CatBoost isolado (mais rapido de")
+print("iterar); a melhoria 5 compara blend uniforme vs pesado. Bases nao sao 100% intercambiaveis,")
+print("mas cada linha documenta corretamente o que foi comparado contra o que na sua propria etapa.")
+
+tab_tentativas_completa = pd.concat([tab_tentativas, tab_nova_rodada], ignore_index=True)
+print("\nResumo de TODAS as tentativas ate agora:")
+print(tab_tentativas_completa.to_string(index=False))
+
+print("\nSegunda rodada de melhorias concluida.")
