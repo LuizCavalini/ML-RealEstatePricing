@@ -6,8 +6,9 @@ Metrica de avaliacao: RMSPE (Root Mean Square Percentage Error) -- por isso
 o target dos modelos e log1p(preco): RMSPE em preco equivale, de forma
 aproximada, a RMSE em log(preco).
 
-EDA (secoes 1-12) + pre-processamento/feature engineering (secoes 13-22) +
-baselines de modelagem com 5-fold CV avaliados por RMSPE (secoes 23-24).
+EDA (secoes 1-12) + pre-processamento/feature engineering/tratamento de
+outliers (secoes 13-23) + baselines de modelagem com 5-fold CV avaliados
+por RMSPE, com e sem outliers (secoes 24-27).
 """
 
 import pickle
@@ -494,9 +495,73 @@ dados = dados.drop(columns=["bairro"])
 
 
 # ---------------------------------------------------------------------------
-# 20. Separacao final: X_train, y_train, X_test
+# 20. Tratamento de outliers (somente no treino)
 # ---------------------------------------------------------------------------
-secao("20. SEPARACAO FINAL: X_train, y_train, X_test")
+secao("20. TRATAMENTO DE OUTLIERS")
+
+# 1. Os imoveis mais caros do treino e percentis extremos do preco
+print("10 imoveis mais caros do treino:")
+print(treino.nlargest(10, "preco")[["preco", "tipo", "bairro", "area_util"]].to_string(index=False))
+
+percentis_extremos = treino["preco"].quantile([0.99, 0.995, 0.999])
+print("\nPercentis extremos do preco (treino):")
+print(percentis_extremos)
+
+# Snapshot do treino ANTES da remocao, para comparar RMSPE com/sem outliers (secoes 25-27).
+# Mesmas features do X_train final -- isola exatamente o efeito da remocao de outliers.
+X_train_com_outliers = (
+    dados.loc[dados["is_train"] == 1].drop(columns=["is_train", "log_preco"]).reset_index(drop=True)
+)
+y_train_com_outliers = dados.loc[dados["is_train"] == 1, "log_preco"].reset_index(drop=True)
+
+# 2. Remover outliers do TREINO usando log_preco (IQR com fator 3, mais permissivo que o
+# 1.5 classico para nao descartar imoveis de alto padrao legitimos)
+log_preco_treino = dados.loc[dados["is_train"] == 1, "log_preco"]
+q1 = log_preco_treino.quantile(0.25)
+q3 = log_preco_treino.quantile(0.75)
+iqr = q3 - q1
+limite_inferior = q1 - 3 * iqr
+limite_superior = q3 + 3 * iqr
+
+print(f"\nQ1={q1:.4f}  Q3={q3:.4f}  IQR={iqr:.4f}")
+print(f"Limite inferior: log_preco={limite_inferior:.4f}  (preco ~ R$ {np.expm1(limite_inferior):,.2f})")
+print(f"Limite superior: log_preco={limite_superior:.4f}  (preco ~ R$ {np.expm1(limite_superior):,.2f})")
+
+mask_outlier = (dados["is_train"] == 1) & (
+    (dados["log_preco"] > limite_superior) | (dados["log_preco"] < limite_inferior)
+)
+idx_outliers = dados.index[mask_outlier]
+
+print(f"\nOutliers detectados pelo criterio IQR (3x): {len(idx_outliers)}")
+if len(idx_outliers) > 0:
+    print(np.expm1(dados.loc[idx_outliers, "log_preco"]).sort_values(ascending=False))
+
+# Fallback: se o IQR nao capturar os extremos conhecidos (R$340M, R$630M), usar cap fixo no p99.5
+maior_outlier = np.expm1(dados.loc[idx_outliers, "log_preco"]).max() if len(idx_outliers) > 0 else 0
+if maior_outlier < 100_000_000:
+    print("\nIQR nao capturou os outliers extremos conhecidos -- aplicando cap fixo no percentil 99.5.")
+    preco_treino_atual = np.expm1(log_preco_treino)
+    p995 = preco_treino_atual.quantile(0.995)
+    mask_outlier = (dados["is_train"] == 1) & (np.expm1(dados["log_preco"]) > p995)
+    idx_outliers = dados.index[mask_outlier]
+    print(f"Percentil 99.5 do preco (treino): R$ {p995:,.2f}")
+    print(f"Outliers detectados pelo cap fixo: {len(idx_outliers)}")
+
+shape_antes = dados.shape[0]
+n_treino_antes = int((dados["is_train"] == 1).sum())
+dados = dados.drop(index=idx_outliers)  # remove apenas linhas de treino (mask exige is_train == 1)
+n_treino_depois = int((dados["is_train"] == 1).sum())
+
+print(f"\nImoveis removidos do treino: {len(idx_outliers)}")
+print(f"Shape combinado: {shape_antes} linhas -> {dados.shape[0]} linhas")
+print(f"Treino: {n_treino_antes} -> {n_treino_depois} imoveis")
+print(f"Teste (inalterado): {int((dados['is_train'] == 0).sum())} imoveis")
+
+
+# ---------------------------------------------------------------------------
+# 21. Separacao final: X_train, y_train, X_test (apos remocao de outliers)
+# ---------------------------------------------------------------------------
+secao("21. SEPARACAO FINAL: X_train, y_train, X_test")
 
 y_train = dados.loc[dados["is_train"] == 1, "log_preco"].reset_index(drop=True)
 X_train = dados.loc[dados["is_train"] == 1].drop(columns=["is_train", "log_preco"]).reset_index(drop=True)
@@ -508,9 +573,9 @@ print(f"X_test : {X_test.shape}")
 
 
 # ---------------------------------------------------------------------------
-# 21. Verificacao final do pre-processamento
+# 22. Verificacao final do pre-processamento
 # ---------------------------------------------------------------------------
-secao("21. VERIFICACAO FINAL DO PRE-PROCESSAMENTO")
+secao("22. VERIFICACAO FINAL DO PRE-PROCESSAMENTO")
 
 print(f"Numero de features finais: {X_train.shape[1]}")
 print("\nLista de features:")
@@ -528,9 +593,9 @@ print("Confirmado: zero NaN em X_train, X_test e y_train.")
 
 
 # ---------------------------------------------------------------------------
-# 22. Salvar dados processados em pickle
+# 23. Salvar dados processados em pickle
 # ---------------------------------------------------------------------------
-secao("22. SALVANDO DADOS PROCESSADOS")
+secao("23. SALVANDO DADOS PROCESSADOS")
 
 dados_processados = {
     "X_train": X_train,
@@ -549,9 +614,9 @@ print("\nPre-processamento e engenharia de features concluidos. Iniciando modela
 
 
 # ---------------------------------------------------------------------------
-# 23. Scorer RMSPE customizado
+# 24. Scorer RMSPE customizado
 # ---------------------------------------------------------------------------
-secao("23. SCORER RMSPE CUSTOMIZADO")
+secao("24. SCORER RMSPE CUSTOMIZADO")
 
 
 def rmspe(y_true_log, y_pred_log):
@@ -574,9 +639,9 @@ print("Scorer sklearn criado com make_scorer(rmspe, greater_is_better=False).")
 
 
 # ---------------------------------------------------------------------------
-# 24. Baselines com 5-fold CV
+# 25. Baselines com 5-fold CV (dados de treino SEM outliers)
 # ---------------------------------------------------------------------------
-secao("24. BASELINES COM 5-FOLD CV")
+secao("25. BASELINES COM 5-FOLD CV (SEM OUTLIERS)")
 
 with open("dados_processados.pkl", "rb") as f:
     dados_pkl = pickle.load(f)
@@ -610,7 +675,54 @@ for nome, modelo in modelos.items():
 tab_resultados = pd.DataFrame(resultados).sort_values("rmspe_medio").reset_index(drop=True)
 tab_resultados.index += 1
 
-print("\nRanking dos modelos (do melhor/menor RMSPE ao pior):")
+print("\nRanking dos modelos SEM outliers (do melhor/menor RMSPE ao pior):")
 print(tab_resultados.to_string())
 
-print("\nModelagem baseline concluida.")
+
+# ---------------------------------------------------------------------------
+# 26. Baselines com 5-fold CV (dados de treino ORIGINAIS, com outliers) - comparacao
+# ---------------------------------------------------------------------------
+secao("26. BASELINES COM 5-FOLD CV (COM OUTLIERS, PARA COMPARACAO)")
+
+resultados_outliers = []
+for nome, modelo in modelos.items():
+    scores = cross_val_score(
+        modelo, X_train_com_outliers, y_train_com_outliers, cv=kf, scoring=rmspe_scorer, n_jobs=1
+    )
+    rmspe_scores = -scores
+    media = rmspe_scores.mean()
+    desvio = rmspe_scores.std()
+    resultados_outliers.append({"modelo": nome, "rmspe_medio": media, "rmspe_std": desvio})
+    print(f"{nome:28s} RMSPE = {media:.4f} +/- {desvio:.4f}")
+
+tab_resultados_outliers = pd.DataFrame(resultados_outliers).sort_values("rmspe_medio").reset_index(drop=True)
+tab_resultados_outliers.index += 1
+
+print("\nRanking dos modelos COM outliers (do melhor/menor RMSPE ao pior):")
+print(tab_resultados_outliers.to_string())
+
+
+# ---------------------------------------------------------------------------
+# 27. Comparacao: RMSPE com vs sem outliers
+# ---------------------------------------------------------------------------
+secao("27. COMPARACAO: RMSPE COM VS SEM OUTLIERS")
+
+comparacao = (
+    tab_resultados[["modelo", "rmspe_medio"]]
+    .rename(columns={"rmspe_medio": "rmspe_sem_outliers"})
+    .merge(
+        tab_resultados_outliers[["modelo", "rmspe_medio"]].rename(columns={"rmspe_medio": "rmspe_com_outliers"}),
+        on="modelo",
+    )
+)
+comparacao["reducao_%"] = (1 - comparacao["rmspe_sem_outliers"] / comparacao["rmspe_com_outliers"]) * 100
+comparacao = comparacao.sort_values("rmspe_sem_outliers").reset_index(drop=True)
+comparacao.index += 1
+
+print(comparacao.to_string())
+print(
+    f"\nMelhor modelo (dados sem outliers): {comparacao.iloc[0]['modelo']} "
+    f"(RMSPE={comparacao.iloc[0]['rmspe_sem_outliers']:.4f})"
+)
+
+print("\nModelagem baseline concluida (com e sem tratamento de outliers).")
