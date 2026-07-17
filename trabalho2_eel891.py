@@ -14,7 +14,9 @@ ensemble (voting e blend multi-seed) e geracao da submissao (secoes 33-38) +
 iteracao/melhorias pos-Kaggle: encoding de bairro, features de interacao e
 corte de outliers mais agressivo, com novas submissoes (secoes 39-42) +
 segunda rodada: re-otimizacao Optuna no dataset v4, weighted blending e
-features extras do texto 'diferenciais' (secoes 43-46).
+features extras do texto 'diferenciais' (secoes 43-46) + terceira rodada:
+stacking com meta-learner, LOO target encoding do bairro, features de
+preco por m2 e binning de numericas (secoes 47-51).
 """
 
 import json
@@ -1716,3 +1718,336 @@ print("\nResumo de TODAS as tentativas ate agora:")
 print(tab_tentativas_completa.to_string(index=False))
 
 print("\nSegunda rodada de melhorias concluida.")
+
+
+# ---------------------------------------------------------------------------
+# 47. Melhoria 7 - Stacking com meta-learner
+# ---------------------------------------------------------------------------
+secao("47. MELHORIA 7 - STACKING COM META-LEARNER")
+
+NOMES_MODELOS_STACK = ["LGBMRegressor", "XGBRegressor", "CatBoostRegressor"]
+
+
+def gerar_meta_features_oof(X, y):
+    """OOF (out-of-fold) previsoes dos 3 modelos base, via o mesmo 'kf' usado em todo o script."""
+    meta = np.zeros((len(X), 3))
+    for idx_tr, idx_val in kf.split(X):
+        X_tr, y_tr = X.iloc[idx_tr], y.iloc[idx_tr]
+        X_val = X.iloc[idx_val]
+        for col, modelo in enumerate(criar_modelos_finais().values()):
+            modelo.fit(X_tr, y_tr)
+            meta[idx_val, col] = modelo.predict(X_val)
+    return pd.DataFrame(meta, columns=NOMES_MODELOS_STACK)
+
+
+def gerar_previsao_stacking(X_tr, y_tr, X_te):
+    """Stacking completo: OOF no treino -> treina Ridge (meta-learner) -> preve teste."""
+    meta_treino = gerar_meta_features_oof(X_tr, y_tr)
+    meta_learner_final = Ridge(alpha=1.0)
+    meta_learner_final.fit(meta_treino, y_tr)
+
+    meta_teste = np.zeros((len(X_te), 3))
+    for col, modelo in enumerate(criar_modelos_finais().values()):
+        modelo.fit(X_tr, y_tr)
+        meta_teste[:, col] = modelo.predict(X_te)
+    meta_teste_df = pd.DataFrame(meta_teste, columns=meta_treino.columns)
+
+    return meta_learner_final.predict(meta_teste_df)
+
+
+# 1-2. Meta-features OOF (5-fold CV) sobre o dataset atual (v4 + melhorias 1-3, sem melhoria 6)
+meta_X_treino = gerar_meta_features_oof(X_train_final, y_train_m6)
+print(f"Meta-features OOF geradas: {meta_X_treino.shape}")
+print(meta_X_treino.describe())
+
+# 3. Ridge como meta-learner sobre as meta-features -> log_preco
+meta_learner = Ridge(alpha=1.0)
+meta_learner.fit(meta_X_treino, y_train_m6)
+print(f"\nCoeficientes do meta-learner: {dict(zip(meta_X_treino.columns, meta_learner.coef_))}")
+print(f"Intercepto: {meta_learner.intercept_:.4f}")
+
+# 5. Comparar via CV: stacking vs voting (melhoria 4) vs blend pesado (melhoria 5).
+# O stacking reaproveita os MESMOS folds do 'kf' usados para gerar as OOF -- pratica padrao
+# (nao e uma nested CV completa, mas o meta-learner e um Ridge de baixa capacidade sobre
+# so 3 features, entao o otimismo residual e pequeno).
+scores_stacking = -cross_val_score(
+    Ridge(alpha=1.0), meta_X_treino, y_train_m6, cv=kf, scoring=rmspe_scorer, n_jobs=1
+)
+print(f"\nStacking (Ridge sobre OOF):                     RMSPE = {scores_stacking.mean():.4f} +/- {scores_stacking.std():.4f}")
+print(f"Voting (melhoria 4, dataset v4, params novos):  RMSPE = {rmspe_melhoria4:.4f} +/- {std_melhoria4:.4f}")
+print(f"Blend pesado (melhoria 5):                       RMSPE = {rmspe_melhoria5:.4f} +/- {std_melhoria5:.4f}")
+
+rmspe_referencia_ensemble = min(rmspe_melhoria4, rmspe_melhoria5)
+std_referencia_ensemble = std_melhoria4 if rmspe_melhoria4 <= rmspe_melhoria5 else std_melhoria5
+melhorou_melhoria7 = bool(scores_stacking.mean() < rmspe_referencia_ensemble)
+print(f"\nMelhoria 7 (stacking) {'MELHOROU' if melhorou_melhoria7 else 'NAO melhorou'} em relacao a voting/blend.")
+
+if melhorou_melhoria7:
+    rmspe_melhoria7, std_melhoria7 = float(scores_stacking.mean()), float(scores_stacking.std())
+else:
+    rmspe_melhoria7, std_melhoria7 = float(rmspe_referencia_ensemble), float(std_referencia_ensemble)
+
+
+# ---------------------------------------------------------------------------
+# 48. Melhoria 8 - Encoding de bairro com Leave-One-Out
+# ---------------------------------------------------------------------------
+secao("48. MELHORIA 8 - ENCODING DE BAIRRO COM LEAVE-ONE-OUT")
+
+# Realinhar 'bairro' bruto ao dataset atual (mesmo corte de linhas da melhoria 3, se aplicado)
+if melhorou_melhoria3:
+    bairro_treino_v4 = bairro_treino.loc[mask_p99.values].reset_index(drop=True)
+else:
+    bairro_treino_v4 = bairro_treino
+
+col_bairro_atual = "bairro_target_enc" if "bairro_target_enc" in X_train_final.columns else "bairro_freq_enc"
+print(f"Coluna de TE substituida pelo LOO: {col_bairro_atual}")
+
+soma_por_bairro = pd.DataFrame({"bairro": bairro_treino_v4, "log_preco": y_train_m6}).groupby("bairro")["log_preco"].sum()
+contagem_por_bairro_v4 = bairro_treino_v4.value_counts()
+media_por_bairro_v4 = pd.DataFrame({"bairro": bairro_treino_v4, "log_preco": y_train_m6}).groupby("bairro")["log_preco"].mean()
+media_global_v4 = y_train_m6.mean()
+
+soma_bairro_row = bairro_treino_v4.map(soma_por_bairro).values
+contagem_bairro_row = bairro_treino_v4.map(contagem_por_bairro_v4).values
+y_values = y_train_m6.values
+
+# 1. LOO: media do bairro EXCLUINDO a propria amostra (fallback p/ bairros com 1 unica amostra)
+divisor_loo_seguro = np.where(contagem_bairro_row > 1, contagem_bairro_row - 1, 1)  # evita divisao por zero
+loo_te_treino = np.where(
+    contagem_bairro_row > 1,
+    (soma_bairro_row - y_values) / divisor_loo_seguro,
+    media_global_v4,
+)
+# 2. Teste: media do bairro no treino completo (nao ha "propria amostra" a excluir)
+loo_te_teste = bairro_teste.map(media_por_bairro_v4).fillna(media_global_v4).values
+
+X_train_m8_base = X_train_final
+X_test_m8_base = X_test_final
+
+X_train_m8_loo = X_train_m8_base.copy()
+X_train_m8_loo[col_bairro_atual] = loo_te_treino
+X_test_m8_loo = X_test_m8_base.copy()
+X_test_m8_loo[col_bairro_atual] = loo_te_teste
+
+
+def avaliar_loo_te_cv(X_outras, bairro_serie, y):
+    """5-fold CV honesto para o LOO target encoding.
+
+    CUIDADO: aplicar o LOO globalmente (uma unica vez, fora da CV) e depois avaliar com
+    cross_val_score vaza dados entre folds -- duas amostras do MESMO bairro em folds
+    diferentes continuam se enxergando pela estatistica agregada compartilhada, mesmo cada
+    uma excluindo so o proprio valor. Por isso o encoding e recalculado AQUI DENTRO de cada
+    fold, usando somente o treino daquele fold (LOO no treino; media simples, sem exclusao,
+    no fold de validacao -- que ja e honesto porque a validacao nao participa do agregado).
+    """
+    scores = []
+    for idx_tr, idx_val in kf.split(X_outras):
+        bairro_tr = bairro_serie.iloc[idx_tr].reset_index(drop=True)
+        bairro_val = bairro_serie.iloc[idx_val].reset_index(drop=True)
+        y_tr = y.iloc[idx_tr].reset_index(drop=True)
+        y_val = y.iloc[idx_val]
+
+        soma_fold = pd.DataFrame({"bairro": bairro_tr, "y": y_tr}).groupby("bairro")["y"].sum()
+        contagem_fold = bairro_tr.value_counts()
+        media_fold = pd.DataFrame({"bairro": bairro_tr, "y": y_tr}).groupby("bairro")["y"].mean()
+        media_global_fold = y_tr.mean()
+
+        soma_row = bairro_tr.map(soma_fold).values
+        contagem_row = bairro_tr.map(contagem_fold).values
+        divisor_seguro = np.where(contagem_row > 1, contagem_row - 1, 1)
+        loo_tr = np.where(contagem_row > 1, (soma_row - y_tr.values) / divisor_seguro, media_global_fold)
+        te_val = bairro_val.map(media_fold).fillna(media_global_fold).values
+
+        X_tr_fold = X_outras.iloc[idx_tr].copy()
+        X_tr_fold[col_bairro_atual] = loo_tr
+        X_val_fold = X_outras.iloc[idx_val].copy()
+        X_val_fold[col_bairro_atual] = te_val
+
+        modelo = CatBoostRegressor(**params_catboost_final, random_seed=42, verbose=0)
+        modelo.fit(X_tr_fold, y_tr)
+        pred = modelo.predict(X_val_fold)
+        scores.append(rmspe(y_val, pred))
+    return np.array(scores)
+
+
+# 3. Comparar via CV com o smoothed TE atual (vencedor da melhoria 1) -- LOO reavaliado
+# fold-a-fold (ver docstring de avaliar_loo_te_cv) para nao inflar o RMSPE por vazamento.
+scores_te_atual = cv_rmspe_catboost_final(X_train_m8_base, y_train_m6)
+scores_loo = avaliar_loo_te_cv(X_train_m8_base, bairro_treino_v4, y_train_m6)
+
+print(f"TE smoothed atual (melhoria 1):  RMSPE = {scores_te_atual.mean():.4f} +/- {scores_te_atual.std():.4f}")
+print(f"LOO target encoding:             RMSPE = {scores_loo.mean():.4f} +/- {scores_loo.std():.4f}")
+
+melhorou_melhoria8 = bool(scores_loo.mean() < scores_te_atual.mean())
+print(f"\nMelhoria 8 {'MELHOROU' if melhorou_melhoria8 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria8:
+    X_train_m8_win, X_test_m8_win = X_train_m8_loo, X_test_m8_loo
+    rmspe_melhoria8, std_melhoria8 = float(scores_loo.mean()), float(scores_loo.std())
+else:
+    X_train_m8_win, X_test_m8_win = X_train_m8_base, X_test_m8_base
+    rmspe_melhoria8, std_melhoria8 = float(scores_te_atual.mean()), float(scores_te_atual.std())
+
+
+# ---------------------------------------------------------------------------
+# 49. Melhoria 9 - Features de preco por m2
+# ---------------------------------------------------------------------------
+secao("49. MELHORIA 9 - FEATURES DE PRECO POR M2")
+
+area_util_treino_m9 = X_train_m8_win["area_util"]
+preco_v4 = np.expm1(y_train_m6)
+preco_por_m2 = preco_v4 / area_util_treino_m9.replace(0, np.nan)
+
+FATOR_SMOOTHING_M2 = 10
+mediana_preco_m2_global = float(preco_por_m2.median())
+
+tmp_m2 = pd.DataFrame({"bairro": bairro_treino_v4, "preco_m2": preco_por_m2})
+contagem_bairro_m2 = tmp_m2.groupby("bairro")["preco_m2"].count()
+mediana_bairro_m2 = tmp_m2.groupby("bairro")["preco_m2"].median()
+
+# 1. bairro_preco_m2 = mediana(preco / area_util) por bairro, com smoothing (mesma logica da
+# melhoria 1, agora aplicada a mediana do preco/m2 em vez da mediana/media de log_preco)
+bairro_preco_m2_smoothed = (
+    contagem_bairro_m2 * mediana_bairro_m2 + FATOR_SMOOTHING_M2 * mediana_preco_m2_global
+) / (contagem_bairro_m2 + FATOR_SMOOTHING_M2)
+
+# CUIDADO com leakage: bairro_preco_m2 calculado SOMENTE com dados de treino (acima).
+bairro_preco_m2_treino = bairro_treino_v4.map(bairro_preco_m2_smoothed).fillna(mediana_preco_m2_global).values
+bairro_preco_m2_teste = bairro_teste.map(bairro_preco_m2_smoothed).fillna(mediana_preco_m2_global).values
+
+# 2-3. preco_m2_estimado = bairro_preco_m2 * area_util ; log_preco_m2_estimado = log1p(...)
+preco_m2_estimado_treino = bairro_preco_m2_treino * X_train_m8_win["area_util"].values
+preco_m2_estimado_teste = bairro_preco_m2_teste * X_test_m8_win["area_util"].values
+
+if "preco_m2_estimado" in X_train_m8_win.columns:
+    print("Nota: 'preco_m2_estimado' ja existia (era um alias de bairro_target_enc, criado na")
+    print("melhoria 2) -- sobrescrevendo com o calculo real de preco por m2 desta melhoria.")
+
+X_train_m9_extra = X_train_m8_win.copy()
+X_train_m9_extra["bairro_preco_m2"] = bairro_preco_m2_treino
+X_train_m9_extra["preco_m2_estimado"] = preco_m2_estimado_treino
+X_train_m9_extra["log_preco_m2_estimado"] = np.log1p(np.clip(preco_m2_estimado_treino, 0, None))
+
+X_test_m9_extra = X_test_m8_win.copy()
+X_test_m9_extra["bairro_preco_m2"] = bairro_preco_m2_teste
+X_test_m9_extra["preco_m2_estimado"] = preco_m2_estimado_teste
+X_test_m9_extra["log_preco_m2_estimado"] = np.log1p(np.clip(preco_m2_estimado_teste, 0, None))
+
+# Base = vencedor da melhoria 8, reaproveitado (evita recomputar 5 fits do CatBoost de novo)
+rmspe_base_m9, std_base_m9 = rmspe_melhoria8, std_melhoria8
+scores_m9_extra = cv_rmspe_catboost_final(X_train_m9_extra, y_train_m6)
+
+print(f"Base (vencedor da melhoria 8, reaproveitado): RMSPE = {rmspe_base_m9:.4f} +/- {std_base_m9:.4f}")
+print(f"Com features de preco por m2:                  RMSPE = {scores_m9_extra.mean():.4f} +/- {scores_m9_extra.std():.4f}")
+
+melhorou_melhoria9 = bool(scores_m9_extra.mean() < rmspe_base_m9)
+print(f"\nMelhoria 9 {'MELHOROU' if melhorou_melhoria9 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria9:
+    X_train_m9_win, X_test_m9_win = X_train_m9_extra, X_test_m9_extra
+    rmspe_melhoria9, std_melhoria9 = float(scores_m9_extra.mean()), float(scores_m9_extra.std())
+else:
+    X_train_m9_win, X_test_m9_win = X_train_m8_win, X_test_m8_win
+    rmspe_melhoria9, std_melhoria9 = rmspe_base_m9, std_base_m9
+
+
+# ---------------------------------------------------------------------------
+# 50. Melhoria 10 - Binning de variaveis numericas
+# ---------------------------------------------------------------------------
+secao("50. MELHORIA 10 - BINNING DE VARIAVEIS NUMERICAS")
+
+# 1. area_util_bin: qcut definido no TREINO, bordas reaplicadas ao teste (evita leakage/
+# inconsistencia de rotulos entre treino e teste)
+area_util_bin_treino, bin_edges = pd.qcut(
+    X_train_m9_win["area_util"], q=10, labels=False, duplicates="drop", retbins=True
+)
+bin_edges_ajustados = bin_edges.copy()
+bin_edges_ajustados[0] = -np.inf
+bin_edges_ajustados[-1] = np.inf
+area_util_bin_teste = pd.cut(X_test_m9_win["area_util"], bins=bin_edges_ajustados, labels=False, include_lowest=True)
+
+# 2. quartos_vagas: interacao categorica simples (quartos*10 + vagas)
+quartos_vagas_treino = X_train_m9_win["quartos"] * 10 + X_train_m9_win["vagas"]
+quartos_vagas_teste = X_test_m9_win["quartos"] * 10 + X_test_m9_win["vagas"]
+
+X_train_m10_extra = X_train_m9_win.copy()
+X_train_m10_extra["area_util_bin"] = area_util_bin_treino.values
+X_train_m10_extra["quartos_vagas"] = quartos_vagas_treino.values
+
+X_test_m10_extra = X_test_m9_win.copy()
+X_test_m10_extra["area_util_bin"] = area_util_bin_teste.values
+X_test_m10_extra["quartos_vagas"] = quartos_vagas_teste.values
+
+print(f"area_util_bin: {int(area_util_bin_treino.nunique())} bins (qcut, q=10, duplicates='drop')")
+
+rmspe_base_m10, std_base_m10 = rmspe_melhoria9, std_melhoria9
+scores_m10_extra = cv_rmspe_catboost_final(X_train_m10_extra, y_train_m6)
+
+print(f"\nBase (vencedor da melhoria 9, reaproveitado): RMSPE = {rmspe_base_m10:.4f} +/- {std_base_m10:.4f}")
+print(f"Com binning (area_util_bin + quartos_vagas):   RMSPE = {scores_m10_extra.mean():.4f} +/- {scores_m10_extra.std():.4f}")
+
+melhorou_melhoria10 = bool(scores_m10_extra.mean() < rmspe_base_m10)
+print(f"\nMelhoria 10 {'MELHOROU' if melhorou_melhoria10 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria10:
+    X_train_m10_win, X_test_m10_win = X_train_m10_extra, X_test_m10_extra
+    rmspe_melhoria10, std_melhoria10 = float(scores_m10_extra.mean()), float(scores_m10_extra.std())
+else:
+    X_train_m10_win, X_test_m10_win = X_train_m9_win, X_test_m9_win
+    rmspe_melhoria10, std_melhoria10 = rmspe_base_m10, std_base_m10
+
+
+# ---------------------------------------------------------------------------
+# 51. Gerar novas submissoes (v7 stacking, v8 melhor combo) e resumo final
+# ---------------------------------------------------------------------------
+secao("51. GERAR NOVAS SUBMISSOES (V7, V8) E RESUMO FINAL")
+
+# v7: efeito isolado do stacking (melhoria 7), sobre o dataset v4 (mesmo da comparacao original)
+if melhorou_melhoria7:
+    pred_log_v7 = gerar_previsao_stacking(X_train_final, y_train_m6, X_test_final)
+    preco_v7 = np.clip(np.expm1(pred_log_v7), PRECO_MINIMO, None)
+    sub_v7 = pd.DataFrame({"Id": test_ids, "preco": preco_v7})
+    sub_v7.to_csv("submissao_v7.csv", index=False)
+    print(f"Submissao salva em 'submissao_v7.csv' ({len(sub_v7)} linhas).")
+    arquivo_v7 = "submissao_v7.csv"
+else:
+    print("Melhoria 7 (stacking) nao superou voting/blend -- 'submissao_v7.csv' NAO gerada.")
+    arquivo_v7 = None
+
+# v8: melhor combo -- dataset final (melhorias 8+9+10 encadeadas) + stacking (se melhoria 7
+# venceu) ou blend uniforme/pesado (se nao), sempre gerada como o checkpoint mais atual.
+print(f"\nDataset final (melhorias 8+9+10): {X_train_m10_win.shape}")
+if melhorou_melhoria7:
+    pred_log_v8 = gerar_previsao_stacking(X_train_m10_win, y_train_m6, X_test_m10_win)
+    preco_v8 = np.clip(np.expm1(pred_log_v8), PRECO_MINIMO, None)
+    sub_v8 = pd.DataFrame({"Id": test_ids, "preco": preco_v8})
+    sub_v8.to_csv("submissao_v8.csv", index=False)
+    print(f"Submissao salva em 'submissao_v8.csv' ({len(sub_v8)} linhas) -- combo com stacking.")
+else:
+    pesos_finais_v8 = pesos if melhorou_melhoria5 else None
+    gerar_submissao_blend_v2(
+        X_train_m10_win, y_train_m6, X_test_m10_win,
+        "submissao_v8.csv", params_lgbm_final, params_xgb_final, params_catboost_final,
+        pesos_uso=pesos_finais_v8,
+    )
+arquivo_v8 = "submissao_v8.csv"
+
+terceira_rodada = pd.DataFrame(
+    [
+        {"versao": "v7 (melhoria 7: stacking)", "rmspe_cv": rmspe_melhoria7, "melhorou": melhorou_melhoria7, "arquivo": arquivo_v7},
+        {"versao": "v8 (melhor combo: melhorias 7+8+9+10)", "rmspe_cv": rmspe_melhoria10, "melhorou": (melhorou_melhoria7 or melhorou_melhoria8 or melhorou_melhoria9 or melhorou_melhoria10), "arquivo": arquivo_v8},
+    ]
+)
+print("\nResumo desta rodada (melhorias 7-10):")
+print(terceira_rodada.to_string(index=False))
+
+print("\nNota sobre as metricas (continuacao): v7 e a comparacao da melhoria 7 usam a mesma base")
+print("de voting/blend das secoes 43-44; as melhorias 8, 9 e 10 usam CatBoost isolado (mesmo padrao")
+print("das melhorias 1-3 e 6). O rmspe_cv de v8 reflete o CatBoost isolado no dataset final, NAO o")
+print("stacking/blend que a submissao realmente usa -- mesma ressalva ja documentada para v6.")
+
+tab_tentativas_final = pd.concat([tab_tentativas_completa, terceira_rodada], ignore_index=True)
+print("\nResumo de TODAS as tentativas (v1-v8):")
+print(tab_tentativas_final.to_string(index=False))
+
+print("\nTerceira rodada de melhorias concluida.")
