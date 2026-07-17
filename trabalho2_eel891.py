@@ -9,7 +9,8 @@ aproximada, a RMSE em log(preco).
 EDA (secoes 1-12) + pre-processamento/feature engineering/tratamento de
 outliers (secoes 13-23) + baselines de modelagem com 5-fold CV avaliados
 por RMSPE, com e sem outliers (secoes 24-27) + otimizacao de
-hiperparametros com Optuna para LightGBM/XGBoost/CatBoost (secoes 28-32).
+hiperparametros com Optuna para LightGBM/XGBoost/CatBoost (secoes 28-32) +
+ensemble (voting e blend multi-seed) e geracao da submissao (secoes 33-38).
 """
 
 import json
@@ -907,3 +908,203 @@ print("\nComparacao: baseline default (5-fold CV) vs otimizado via Optuna (5-fol
 print(comparacao_final.to_string())
 
 print("\nOtimizacao de hiperparametros concluida.")
+
+
+# ---------------------------------------------------------------------------
+# 33. Ensemble - setup (carregar melhores parametros dos JSONs)
+# ---------------------------------------------------------------------------
+secao("33. ENSEMBLE - SETUP")
+
+with open("best_lgbm.json") as f:
+    params_lgbm = json.load(f)
+with open("best_xgb.json") as f:
+    params_xgb = json.load(f)
+with open("best_catboost.json") as f:
+    params_catboost = json.load(f)
+
+print("Melhores parametros recarregados de best_lgbm.json, best_xgb.json e best_catboost.json.")
+
+
+def criar_modelos_otimizados(seed):
+    """Instancia os 3 modelos otimizados com uma seed especifica (para blend multi-seed)."""
+    return {
+        "LGBMRegressor": LGBMRegressor(**params_lgbm, random_state=seed, verbose=-1),
+        "XGBRegressor": XGBRegressor(**params_xgb, random_state=seed, verbosity=0),
+        "CatBoostRegressor": CatBoostRegressor(**params_catboost, random_seed=seed, verbose=0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 34. Ensemble - Voting (media das 3 previsoes, 5-fold CV)
+# ---------------------------------------------------------------------------
+secao("34. ENSEMBLE - VOTING (MEDIA DOS 3 MODELOS, 5-FOLD CV)")
+
+rmspe_voting_folds = []
+for fold, (idx_tr, idx_val) in enumerate(kf.split(X_train), start=1):
+    X_tr, X_val = X_train.iloc[idx_tr], X_train.iloc[idx_val]
+    y_tr, y_val = y_train.iloc[idx_tr], y_train.iloc[idx_val]
+
+    preds_val = []
+    for nome, modelo in criar_modelos_otimizados(seed=42).items():
+        modelo.fit(X_tr, y_tr)
+        preds_val.append(modelo.predict(X_val))
+
+    pred_media = np.mean(preds_val, axis=0)
+    rmspe_fold = rmspe(y_val, pred_media)
+    rmspe_voting_folds.append(rmspe_fold)
+    print(f"Fold {fold}: RMSPE = {rmspe_fold:.4f}")
+
+rmspe_voting_media = float(np.mean(rmspe_voting_folds))
+rmspe_voting_std = float(np.std(rmspe_voting_folds))
+print(f"\nVoting Ensemble (3 modelos): RMSPE = {rmspe_voting_media:.4f} +/- {rmspe_voting_std:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# 35. Ensemble - Blend multi-seed (3 seeds x 3 modelos = 9 modelos, 5-fold CV)
+# ---------------------------------------------------------------------------
+secao("35. ENSEMBLE - BLEND MULTI-SEED (3 SEEDS X 3 MODELOS, 5-FOLD CV)")
+
+seeds_blend_cv = [42, 123, 2026]
+
+rmspe_blend_folds = []
+for fold, (idx_tr, idx_val) in enumerate(kf.split(X_train), start=1):
+    X_tr, X_val = X_train.iloc[idx_tr], X_train.iloc[idx_val]
+    y_tr, y_val = y_train.iloc[idx_tr], y_train.iloc[idx_val]
+
+    preds_val = []
+    for seed in seeds_blend_cv:
+        for nome, modelo in criar_modelos_otimizados(seed=seed).items():
+            modelo.fit(X_tr, y_tr)
+            preds_val.append(modelo.predict(X_val))
+
+    pred_media = np.mean(preds_val, axis=0)
+    rmspe_fold = rmspe(y_val, pred_media)
+    rmspe_blend_folds.append(rmspe_fold)
+    print(f"Fold {fold}: RMSPE = {rmspe_fold:.4f}  ({len(preds_val)} modelos no blend)")
+
+rmspe_blend_media = float(np.mean(rmspe_blend_folds))
+rmspe_blend_std = float(np.std(rmspe_blend_folds))
+print(f"\nBlend multi-seed (9 modelos): RMSPE = {rmspe_blend_media:.4f} +/- {rmspe_blend_std:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# 36. Comparacao: individuais vs Voting vs Blend
+# ---------------------------------------------------------------------------
+secao("36. COMPARACAO: INDIVIDUAIS VS VOTING VS BLEND")
+
+comparacao_ensemble = pd.concat(
+    [
+        tab_otimizados[["modelo", "rmspe_medio", "rmspe_std"]],
+        pd.DataFrame(
+            [
+                {"modelo": "Voting (3 modelos)", "rmspe_medio": rmspe_voting_media, "rmspe_std": rmspe_voting_std},
+                {
+                    "modelo": "Blend multi-seed (9 modelos)",
+                    "rmspe_medio": rmspe_blend_media,
+                    "rmspe_std": rmspe_blend_std,
+                },
+            ]
+        ),
+    ],
+    ignore_index=True,
+).sort_values("rmspe_medio").reset_index(drop=True)
+comparacao_ensemble.index += 1
+
+print("Todos avaliados com as MESMAS 5 dobras do KFold (mesma seed) -- comparacao justa:")
+print(comparacao_ensemble.to_string())
+
+melhor_abordagem = comparacao_ensemble.iloc[0]["modelo"]
+print(f"\nMelhor abordagem pelo CV: {melhor_abordagem} (RMSPE={comparacao_ensemble.iloc[0]['rmspe_medio']:.4f})")
+
+
+# ---------------------------------------------------------------------------
+# 37. Geracao da submissao (blend multi-seed no dataset completo)
+# ---------------------------------------------------------------------------
+secao("37. GERACAO DA SUBMISSAO")
+
+# 4. Escolha da abordagem para a submissao final. O blend multi-seed reduz a variancia
+# associada a inicializacao aleatoria de cada modelo (menos dependente de uma unica seed
+# "sortuda"), sendo a estrategia mais robusta para generalizar no leaderboard -- mesmo
+# quando seu RMSPE medio de CV fica proximo ao do melhor modelo/estrategia individual.
+print(f"Abordagem com menor RMSPE no CV: {melhor_abordagem}")
+print("Estrategia adotada para a submissao final: Blend multi-seed (maior robustez a variancia entre seeds).")
+
+# 5. Treinar cada modelo com 5 seeds diferentes no treino completo (sem outliers) e prever o teste
+seeds_submissao = [42, 123, 2026, 7, 99]
+
+previsoes_test = []
+for seed in seeds_submissao:
+    for nome, modelo in criar_modelos_otimizados(seed=seed).items():
+        modelo.fit(X_train, y_train)
+        pred_log = modelo.predict(X_test)
+        previsoes_test.append(pred_log)
+        print(f"  seed={seed:<5d} {nome:20s} treinado e previsao gerada.")
+
+pred_log_media = np.mean(previsoes_test, axis=0)
+print(f"\nTotal de modelos no blend final: {len(previsoes_test)} ({len(seeds_submissao)} seeds x 3 modelos)")
+
+# Converter para preco (espaco original) e clipar valores nao positivos / muito baixos
+PRECO_MINIMO = 10_000
+preco_predito = np.expm1(pred_log_media)
+n_clipados = int((preco_predito < PRECO_MINIMO).sum())
+preco_predito = np.clip(preco_predito, PRECO_MINIMO, None)
+print(f"Precos abaixo de R$ {PRECO_MINIMO:,.0f} clipados para o minimo: {n_clipados}")
+
+submissao = pd.DataFrame({"Id": test_ids, "preco": preco_predito})
+
+# Verificar formato contra o exemplo antes de salvar
+exemplo = pd.read_csv("exemplo_arquivo_respostas.csv")
+print(f"\nFormato da submissao: {submissao.shape}  |  formato do exemplo: {exemplo.shape}")
+print(f"Colunas da submissao: {list(submissao.columns)}  |  colunas do exemplo: {list(exemplo.columns)}")
+assert list(submissao.columns) == list(exemplo.columns), "Colunas da submissao nao batem com o exemplo!"
+assert submissao.shape[0] == exemplo.shape[0], "Numero de linhas da submissao nao bate com o exemplo!"
+assert submissao["Id"].isin(exemplo["Id"]).all(), "Ha Ids na submissao que nao existem no exemplo!"
+assert submissao["Id"].is_unique, "Ha Ids duplicados na submissao!"
+print("Formato validado com sucesso contra exemplo_arquivo_respostas.csv.")
+
+submissao.to_csv("submissao_kaggle.csv", index=False)
+print("\nSubmissao salva em 'submissao_kaggle.csv'.")
+
+
+# ---------------------------------------------------------------------------
+# 38. Distribuicao das previsoes
+# ---------------------------------------------------------------------------
+secao("38. DISTRIBUICAO DAS PREVISOES")
+
+stats_pred = submissao["preco"].describe(percentiles=[0.25, 0.5, 0.75])
+print("Estatisticas do preco predito (teste):")
+print(stats_pred)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+preco_treino_limpo = np.expm1(y_train)
+sns.histplot(
+    preco_treino_limpo, bins=60, color="#4C72B0", stat="density",
+    label="treino (sem outliers)", alpha=0.5, ax=axes[0],
+)
+sns.histplot(
+    submissao["preco"], bins=60, color="#DD8452", stat="density",
+    label="teste (previsto)", alpha=0.5, ax=axes[0],
+)
+axes[0].set_title("Preco: treino vs previsto (teste)")
+axes[0].set_xlabel("preco (R$)")
+axes[0].legend()
+
+sns.histplot(
+    y_train, bins=60, color="#4C72B0", stat="density",
+    label="treino (sem outliers)", alpha=0.5, ax=axes[1],
+)
+sns.histplot(
+    pred_log_media, bins=60, color="#DD8452", stat="density",
+    label="teste (previsto)", alpha=0.5, ax=axes[1],
+)
+axes[1].set_title("log1p(preco): treino vs previsto (teste)")
+axes[1].set_xlabel("log1p(preco)")
+axes[1].legend()
+
+fig.tight_layout()
+fig.savefig("eda_submissao_distribuicao.png", dpi=120)
+plt.close(fig)
+print("\nFigura salva em eda_submissao_distribuicao.png")
+
+print("\nEnsemble e geracao de submissao concluidos.")
