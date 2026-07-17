@@ -1,10 +1,16 @@
 """
-Trabalho 2 - EEL891 - Analise Exploratoria de Dados
+Trabalho 2 - EEL891 - Analise Exploratoria de Dados, Pre-processamento
+e Engenharia de Features.
 Problema de regressao: estimar preco de venda de imoveis.
-Metrica de avaliacao: RMSPE (Root Mean Square Percentage Error).
+Metrica de avaliacao: RMSPE (Root Mean Square Percentage Error) -- por isso
+o target dos modelos e log1p(preco): RMSPE em preco equivale, de forma
+aproximada, a RMSE em log(preco).
 
-Apenas EDA. Nenhum modelo e treinado aqui.
+EDA (secoes 1-12) + pre-processamento/feature engineering (secoes 13-22).
+Nenhum modelo e treinado aqui.
 """
+
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -338,4 +344,198 @@ observacoes = [
 for obs in observacoes:
     print(obs)
 
-print("\nEDA concluida. Nenhum modelo foi treinado neste script.")
+print("\nEDA concluida. Iniciando pre-processamento e engenharia de features.")
+
+
+# ---------------------------------------------------------------------------
+# 13. Pre-processamento: target, ids e unificacao treino+teste
+# ---------------------------------------------------------------------------
+secao("13. PRE-PROCESSAMENTO - TARGET, IDS E UNIFICACAO DOS CONJUNTOS")
+
+# 1. Separar target e ids
+target = treino["preco"].copy()
+test_ids = teste["Id"].copy()
+
+# 2. log_preco = target real para treinar os modelos (RMSPE em preco ~= RMSE em log_preco)
+treino_prep = treino.drop(columns=["log_preco"]).copy()  # remove coluna auxiliar criada na EDA (secao 8)
+treino_prep["log_preco"] = np.log1p(treino_prep["preco"])
+teste_prep = teste.copy()
+
+# 3. Combinar treino + teste com flag is_train (preprocessamento uniforme)
+treino_prep["is_train"] = 1
+teste_prep["is_train"] = 0
+dados = pd.concat([treino_prep, teste_prep], axis=0, ignore_index=True, sort=False)
+
+print(f"Dados combinados: {dados.shape[0]} linhas x {dados.shape[1]} colunas")
+print(f"  is_train=1 (treino): {(dados['is_train'] == 1).sum()}")
+print(f"  is_train=0 (teste) : {(dados['is_train'] == 0).sum()}")
+
+# 4. Remover Id e preco do combinado (ja preservados em test_ids / target / log_preco)
+dados = dados.drop(columns=["Id", "preco"])
+print("Colunas 'Id' e 'preco' removidas do DataFrame combinado.")
+
+
+# ---------------------------------------------------------------------------
+# 14. Tratamento da coluna 'diferenciais'
+# ---------------------------------------------------------------------------
+secao("14. TRATAMENTO DA COLUNA 'diferenciais'")
+
+dados["n_palavras_diferenciais"] = dados["diferenciais"].fillna("").str.split().apply(len)
+dados["tem_diferenciais"] = dados["diferenciais"].notnull().astype(int)
+
+print("n_palavras_diferenciais - estatisticas:")
+print(dados["n_palavras_diferenciais"].describe())
+print("\ntem_diferenciais - contagem:")
+print(dados["tem_diferenciais"].value_counts())
+
+dados = dados.drop(columns=["diferenciais"])
+print("\nColuna 'diferenciais' removida (as 10 binarias ja capturam a informacao, ver secao 10).")
+
+
+# ---------------------------------------------------------------------------
+# 15. Tratamento de nulos
+# ---------------------------------------------------------------------------
+secao("15. TRATAMENTO DE NULOS")
+
+# 6. area_extra: nulo = imovel sem area extra
+n_nulos_area_extra = dados["area_extra"].isnull().sum()
+dados["area_extra"] = dados["area_extra"].fillna(0)
+print(f"area_extra: {n_nulos_area_extra} nulo(s) preenchido(s) com 0")
+
+# 7. Demais numericas: preencher com a mediana calculada no treino
+outras_numericas = [c for c in COLS_NUMERICAS if c != "area_extra"]
+for col in outras_numericas:
+    n_nulos_col = dados[col].isnull().sum()
+    if n_nulos_col > 0:
+        mediana = dados.loc[dados["is_train"] == 1, col].median()
+        dados[col] = dados[col].fillna(mediana)
+        print(f"{col}: {n_nulos_col} nulo(s) preenchido(s) com a mediana do treino ({mediana})")
+    else:
+        print(f"{col}: nenhum nulo encontrado")
+
+# 8. Verificar nulos restantes (log_preco tem NaN no teste por definicao -- alvo desconhecido)
+nulos_restantes = dados.drop(columns=["log_preco"]).isnull().sum()
+nulos_restantes = nulos_restantes[nulos_restantes > 0]
+print("\nNulos restantes (exceto 'log_preco', que e NaN no teste por nao ter alvo conhecido):")
+print(nulos_restantes if not nulos_restantes.empty else "  Nenhum. Zero NaN confirmado.")
+assert nulos_restantes.empty, "Existem nulos nao tratados no DataFrame combinado!"
+
+
+# ---------------------------------------------------------------------------
+# 16. Feature engineering
+# ---------------------------------------------------------------------------
+secao("16. FEATURE ENGINEERING")
+
+dados["area_total"] = dados["area_util"] + dados["area_extra"]
+dados["log_area_util"] = np.log1p(dados["area_util"])
+dados["log_area_total"] = np.log1p(dados["area_total"])
+dados["area_por_quarto"] = dados["area_util"] / (dados["quartos"] + 1)
+dados["tem_suite"] = (dados["suites"] > 0).astype(int)
+dados["proporcao_suites"] = dados["suites"] / (dados["quartos"] + 1)
+dados["total_amenidades"] = dados[COLS_BINARIAS].sum(axis=1)
+dados["categoria_luxo"] = ((dados["piscina"] + dados["sauna"] + dados["vista_mar"]) >= 2).astype(int)
+dados["tem_area_extra"] = (dados["area_extra"] > 0).astype(int)
+
+novas_features = [
+    "area_total", "log_area_util", "log_area_total", "area_por_quarto",
+    "tem_suite", "proporcao_suites", "total_amenidades", "categoria_luxo", "tem_area_extra",
+]
+print("Novas features criadas (estatisticas descritivas):")
+print(dados[novas_features].describe().T)
+
+
+# ---------------------------------------------------------------------------
+# 17. Encoding - 'tipo' (One-Hot Encoding)
+# ---------------------------------------------------------------------------
+secao("17. ENCODING - 'tipo' (One-Hot Encoding)")
+
+colunas_antes = set(dados.columns)
+dados = pd.get_dummies(dados, columns=["tipo"], prefix="tipo", dtype=int)
+colunas_tipo = sorted(set(dados.columns) - colunas_antes)
+print(f"Colunas geradas para 'tipo': {colunas_tipo}")
+
+
+# ---------------------------------------------------------------------------
+# 18. Encoding - 'tipo_vendedor' (binaria)
+# ---------------------------------------------------------------------------
+secao("18. ENCODING - 'tipo_vendedor' (binaria)")
+
+dados["tipo_vendedor_imobiliaria"] = (dados["tipo_vendedor"] == "Imobiliaria").astype(int)
+dados = dados.drop(columns=["tipo_vendedor"])
+print("Criada 'tipo_vendedor_imobiliaria' (1=Imobiliaria, 0=Pessoa Fisica):")
+print(dados["tipo_vendedor_imobiliaria"].value_counts())
+
+
+# ---------------------------------------------------------------------------
+# 19. Encoding - 'bairro' (Target Encoding por mediana, apenas com dados de treino)
+# ---------------------------------------------------------------------------
+secao("19. ENCODING - 'bairro' (Target Encoding pela mediana de log_preco)")
+
+mediana_por_bairro = dados.loc[dados["is_train"] == 1].groupby("bairro")["log_preco"].median()
+mediana_global = dados.loc[dados["is_train"] == 1, "log_preco"].median()
+
+dados["bairro_target_enc"] = dados["bairro"].map(mediana_por_bairro)
+n_linhas_bairro_desconhecido = dados["bairro_target_enc"].isnull().sum()
+dados["bairro_target_enc"] = dados["bairro_target_enc"].fillna(mediana_global)
+
+print(f"Mediana global de log_preco (fallback para bairro desconhecido): {mediana_global:.4f}")
+print(f"Linhas com bairro sem correspondencia no treino (preenchidas com fallback): {n_linhas_bairro_desconhecido}")
+print("\nTop 5 bairros por mediana de log_preco (treino):")
+print(mediana_por_bairro.sort_values(ascending=False).head())
+
+dados = dados.drop(columns=["bairro"])
+
+
+# ---------------------------------------------------------------------------
+# 20. Separacao final: X_train, y_train, X_test
+# ---------------------------------------------------------------------------
+secao("20. SEPARACAO FINAL: X_train, y_train, X_test")
+
+y_train = dados.loc[dados["is_train"] == 1, "log_preco"].reset_index(drop=True)
+X_train = dados.loc[dados["is_train"] == 1].drop(columns=["is_train", "log_preco"]).reset_index(drop=True)
+X_test = dados.loc[dados["is_train"] == 0].drop(columns=["is_train", "log_preco"]).reset_index(drop=True)
+
+print(f"X_train: {X_train.shape}")
+print(f"y_train: {y_train.shape}")
+print(f"X_test : {X_test.shape}")
+
+
+# ---------------------------------------------------------------------------
+# 21. Verificacao final do pre-processamento
+# ---------------------------------------------------------------------------
+secao("21. VERIFICACAO FINAL DO PRE-PROCESSAMENTO")
+
+print(f"Numero de features finais: {X_train.shape[1]}")
+print("\nLista de features:")
+for c in X_train.columns:
+    print(f"  - {c}")
+
+nan_train = int(X_train.isnull().sum().sum())
+nan_test = int(X_test.isnull().sum().sum())
+nan_y = int(y_train.isnull().sum())
+print(f"\nNaN em X_train: {nan_train}")
+print(f"NaN em X_test : {nan_test}")
+print(f"NaN em y_train: {nan_y}")
+assert nan_train == 0 and nan_test == 0 and nan_y == 0, "Existem NaN remanescentes apos o pre-processamento!"
+print("Confirmado: zero NaN em X_train, X_test e y_train.")
+
+
+# ---------------------------------------------------------------------------
+# 22. Salvar dados processados em pickle
+# ---------------------------------------------------------------------------
+secao("22. SALVANDO DADOS PROCESSADOS")
+
+dados_processados = {
+    "X_train": X_train,
+    "y_train": y_train,
+    "X_test": X_test,
+    "test_ids": test_ids,
+    "target_original": target,
+}
+with open("dados_processados.pkl", "wb") as f:
+    pickle.dump(dados_processados, f)
+
+print("Dados processados salvos em 'dados_processados.pkl'")
+print("Chaves salvas: X_train, y_train, X_test, test_ids, target_original")
+
+print("\nPre-processamento e engenharia de features concluidos. Nenhum modelo foi treinado neste script.")
