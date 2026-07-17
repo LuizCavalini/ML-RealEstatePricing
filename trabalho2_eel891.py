@@ -6,8 +6,8 @@ Metrica de avaliacao: RMSPE (Root Mean Square Percentage Error) -- por isso
 o target dos modelos e log1p(preco): RMSPE em preco equivale, de forma
 aproximada, a RMSE em log(preco).
 
-EDA (secoes 1-12) + pre-processamento/feature engineering (secoes 13-22).
-Nenhum modelo e treinado aqui.
+EDA (secoes 1-12) + pre-processamento/feature engineering (secoes 13-22) +
+baselines de modelagem com 5-fold CV avaliados por RMSPE (secoes 23-24).
 """
 
 import pickle
@@ -16,6 +16,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from catboost import CatBoostRegressor
+from lightgbm import LGBMRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Lasso, LinearRegression, Ridge
+from sklearn.metrics import make_scorer
+from sklearn.model_selection import KFold, cross_val_score
+from xgboost import XGBRegressor
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 160)
@@ -538,4 +545,72 @@ with open("dados_processados.pkl", "wb") as f:
 print("Dados processados salvos em 'dados_processados.pkl'")
 print("Chaves salvas: X_train, y_train, X_test, test_ids, target_original")
 
-print("\nPre-processamento e engenharia de features concluidos. Nenhum modelo foi treinado neste script.")
+print("\nPre-processamento e engenharia de features concluidos. Iniciando modelagem baseline.")
+
+
+# ---------------------------------------------------------------------------
+# 23. Scorer RMSPE customizado
+# ---------------------------------------------------------------------------
+secao("23. SCORER RMSPE CUSTOMIZADO")
+
+
+def rmspe(y_true_log, y_pred_log):
+    """RMSPE no espaco original do preco, a partir de previsoes em log1p(preco).
+
+    RMSPE = sqrt(mean(((y_true - y_pred) / y_true) ** 2)). Quanto MENOR, melhor.
+    """
+    y_true = np.expm1(y_true_log)
+    y_pred = np.expm1(y_pred_log)
+    return np.sqrt(np.mean(((y_true - y_pred) / y_true) ** 2))
+
+
+rmspe_scorer = make_scorer(rmspe, greater_is_better=False)
+
+print("Funcao rmspe(y_true_log, y_pred_log) definida:")
+print("  a) converte y_true_log e y_pred_log para o espaco original via np.expm1()")
+print("  b) calcula RMSPE = sqrt(mean(((y_true - y_pred) / y_true) ** 2))")
+print("  c) retorna o valor (quanto MENOR, melhor)")
+print("Scorer sklearn criado com make_scorer(rmspe, greater_is_better=False).")
+
+
+# ---------------------------------------------------------------------------
+# 24. Baselines com 5-fold CV
+# ---------------------------------------------------------------------------
+secao("24. BASELINES COM 5-FOLD CV")
+
+with open("dados_processados.pkl", "rb") as f:
+    dados_pkl = pickle.load(f)
+
+X = dados_pkl["X_train"]
+y = dados_pkl["y_train"]
+
+# KFold simples: StratifiedKFold nao se aplica a regressao (nao ha classes para estratificar).
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+modelos = {
+    "LinearRegression": LinearRegression(),
+    "Ridge": Ridge(alpha=1.0),
+    "Lasso": Lasso(alpha=1.0),
+    "RandomForestRegressor": RandomForestRegressor(n_estimators=200, random_state=42),
+    "GradientBoostingRegressor": GradientBoostingRegressor(n_estimators=200, random_state=42),
+    "LGBMRegressor": LGBMRegressor(n_estimators=400, verbose=-1, random_state=42),
+    "XGBRegressor": XGBRegressor(n_estimators=400, verbosity=0, random_state=42),
+    "CatBoostRegressor": CatBoostRegressor(iterations=400, verbose=0, random_seed=42),
+}
+
+resultados = []
+for nome, modelo in modelos.items():
+    scores = cross_val_score(modelo, X, y, cv=kf, scoring=rmspe_scorer, n_jobs=1)
+    rmspe_scores = -scores  # make_scorer com greater_is_better=False inverte o sinal
+    media = rmspe_scores.mean()
+    desvio = rmspe_scores.std()
+    resultados.append({"modelo": nome, "rmspe_medio": media, "rmspe_std": desvio})
+    print(f"{nome:28s} RMSPE = {media:.4f} +/- {desvio:.4f}")
+
+tab_resultados = pd.DataFrame(resultados).sort_values("rmspe_medio").reset_index(drop=True)
+tab_resultados.index += 1
+
+print("\nRanking dos modelos (do melhor/menor RMSPE ao pior):")
+print(tab_resultados.to_string())
+
+print("\nModelagem baseline concluida.")
