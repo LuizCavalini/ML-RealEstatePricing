@@ -1,0 +1,9 @@
+__pycache__/
+*.pkl
+catboost_info/
+*.log
+submissao_*.csv
+sub_*.csv
+resumo_otimizacao.json
+best_*.json
+otimizacao_local.py
