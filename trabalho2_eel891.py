@@ -10,7 +10,9 @@ EDA (secoes 1-12) + pre-processamento/feature engineering/tratamento de
 outliers (secoes 13-23) + baselines de modelagem com 5-fold CV avaliados
 por RMSPE, com e sem outliers (secoes 24-27) + otimizacao de
 hiperparametros com Optuna para LightGBM/XGBoost/CatBoost (secoes 28-32) +
-ensemble (voting e blend multi-seed) e geracao da submissao (secoes 33-38).
+ensemble (voting e blend multi-seed) e geracao da submissao (secoes 33-38) +
+iteracao/melhorias pos-Kaggle: encoding de bairro, features de interacao e
+corte de outliers mais agressivo, com novas submissoes (secoes 39-42).
 """
 
 import json
@@ -555,6 +557,10 @@ shape_antes = dados.shape[0]
 n_treino_antes = int((dados["is_train"] == 1).sum())
 dados = dados.drop(index=idx_outliers)  # remove apenas linhas de treino (mask exige is_train == 1)
 n_treino_depois = int((dados["is_train"] == 1).sum())
+
+# Indices originais do treino (== indices de 'treino') que sobreviveram -- usados mais tarde
+# (secao 39) para re-derivar a coluna 'bairro' bruta, ja removida de 'dados' na secao 19.
+idx_treino_limpo = dados.index[dados["is_train"] == 1]
 
 print(f"\nImoveis removidos do treino: {len(idx_outliers)}")
 print(f"Shape combinado: {shape_antes} linhas -> {dados.shape[0]} linhas")
@@ -1108,3 +1114,232 @@ plt.close(fig)
 print("\nFigura salva em eda_submissao_distribuicao.png")
 
 print("\nEnsemble e geracao de submissao concluidos.")
+
+
+# ---------------------------------------------------------------------------
+# 39. Melhoria 1 - Target Encoding do bairro (variantes)
+# ---------------------------------------------------------------------------
+secao("39. MELHORIA 1 - TARGET ENCODING DO BAIRRO (VARIANTES)")
+
+print("Contexto: score no Kaggle = 0.2535, CV do blend/voting (secao 36) = 0.2333.")
+print("Gap de ~0.02 sugere leve overfitting -- mesma licao do Trabalho 1 com target encoding")
+print("de alta cardinalidade. Testando variantes de encoding do bairro, cada uma avaliada")
+print("com 5-fold CV usando o CatBoost otimizado (mesma metodologia em todas as variantes).\n")
+
+# Recuperar a coluna 'bairro' bruta, alinhada com X_train (pos-remocao de outliers) e X_test
+bairro_treino = treino.loc[idx_treino_limpo, "bairro"].reset_index(drop=True)
+bairro_teste = teste["bairro"].reset_index(drop=True)
+
+FATOR_SMOOTHING = 10
+contagem_bairro = bairro_treino.value_counts()
+media_bairro = (
+    pd.DataFrame({"bairro": bairro_treino, "log_preco": y_train}).groupby("bairro")["log_preco"].mean()
+)
+media_global_log_preco = y_train.mean()
+freq_bairro = bairro_treino.value_counts(normalize=True)
+te_bairro_smoothed = (
+    contagem_bairro * media_bairro + FATOR_SMOOTHING * media_global_log_preco
+) / (contagem_bairro + FATOR_SMOOTHING)
+
+
+def construir_variante_bairro(modo):
+    """Retorna (X_train_variante, X_test_variante) trocando o encoding de bairro."""
+    X_tr = X_train.drop(columns=["bairro_target_enc"]).copy()
+    X_te = X_test.drop(columns=["bairro_target_enc"]).copy()
+
+    if modo == "smoothed":
+        X_tr["bairro_target_enc"] = bairro_treino.map(te_bairro_smoothed).values
+        X_te["bairro_target_enc"] = bairro_teste.map(te_bairro_smoothed).fillna(media_global_log_preco).values
+    elif modo == "freq":
+        X_tr["bairro_freq_enc"] = bairro_treino.map(freq_bairro).values
+        X_te["bairro_freq_enc"] = bairro_teste.map(freq_bairro).fillna(0.0).values
+    elif modo == "smoothed_freq":
+        X_tr["bairro_target_enc"] = bairro_treino.map(te_bairro_smoothed).values
+        X_te["bairro_target_enc"] = bairro_teste.map(te_bairro_smoothed).fillna(media_global_log_preco).values
+        X_tr["bairro_freq_enc"] = bairro_treino.map(freq_bairro).values
+        X_te["bairro_freq_enc"] = bairro_teste.map(freq_bairro).fillna(0.0).values
+    return X_tr, X_te
+
+
+def cv_rmspe_catboost(X, y):
+    """5-fold CV (mesmo 'kf' usado em todo o script) com o CatBoost otimizado."""
+    scores = cross_val_score(
+        CatBoostRegressor(**params_catboost, random_seed=42, verbose=0),
+        X, y, cv=kf, scoring=rmspe_scorer, n_jobs=1,
+    )
+    return -scores
+
+
+resultados_bairro = []
+
+# a) TE atual (mediana de log_preco por bairro) -- ja computado na secao 32, reaproveitado
+rmspe_atual = tab_otimizados.loc[tab_otimizados["modelo"] == "CatBoostRegressor", "rmspe_medio"].iloc[0]
+std_atual = tab_otimizados.loc[tab_otimizados["modelo"] == "CatBoostRegressor", "rmspe_std"].iloc[0]
+resultados_bairro.append({"variante": "a) TE atual (mediana)", "rmspe_medio": rmspe_atual, "rmspe_std": std_atual})
+print(f"a) TE atual (mediana):   RMSPE = {rmspe_atual:.4f} +/- {std_atual:.4f}  (reaproveitado da secao 32)")
+
+# b) TE com smoothing
+X_tr_b, X_te_b = construir_variante_bairro("smoothed")
+scores_b = cv_rmspe_catboost(X_tr_b, y_train)
+resultados_bairro.append({"variante": "b) TE smoothed (m=10)", "rmspe_medio": scores_b.mean(), "rmspe_std": scores_b.std()})
+print(f"b) TE smoothed (m=10):   RMSPE = {scores_b.mean():.4f} +/- {scores_b.std():.4f}")
+
+# c) Frequency encoding
+X_tr_c, X_te_c = construir_variante_bairro("freq")
+scores_c = cv_rmspe_catboost(X_tr_c, y_train)
+resultados_bairro.append({"variante": "c) Frequency encoding", "rmspe_medio": scores_c.mean(), "rmspe_std": scores_c.std()})
+print(f"c) Frequency encoding:   RMSPE = {scores_c.mean():.4f} +/- {scores_c.std():.4f}")
+
+# d) TE smoothed + frequency encoding combinados
+X_tr_d, X_te_d = construir_variante_bairro("smoothed_freq")
+scores_d = cv_rmspe_catboost(X_tr_d, y_train)
+resultados_bairro.append({"variante": "d) TE smoothed + freq", "rmspe_medio": scores_d.mean(), "rmspe_std": scores_d.std()})
+print(f"d) TE smoothed + freq:   RMSPE = {scores_d.mean():.4f} +/- {scores_d.std():.4f}")
+
+tab_bairro = pd.DataFrame(resultados_bairro).sort_values("rmspe_medio").reset_index(drop=True)
+tab_bairro.index += 1
+print("\nRanking das variantes de encoding de bairro:")
+print(tab_bairro.to_string())
+
+variante_vencedora = tab_bairro.iloc[0]["variante"]
+melhorou_melhoria1 = tab_bairro.iloc[0]["rmspe_medio"] < rmspe_atual
+print(f"\nMelhor variante: {variante_vencedora}")
+print(f"Melhoria 1 {'MELHOROU' if melhorou_melhoria1 else 'NAO melhorou'} o RMSPE em relacao ao TE atual.")
+
+variantes_X_bairro = {
+    "a) TE atual (mediana)": (X_train, X_test),
+    "b) TE smoothed (m=10)": (X_tr_b, X_te_b),
+    "c) Frequency encoding": (X_tr_c, X_te_c),
+    "d) TE smoothed + freq": (X_tr_d, X_te_d),
+}
+X_train_melhoria1, X_test_melhoria1 = variantes_X_bairro[variante_vencedora]
+
+
+# ---------------------------------------------------------------------------
+# 40. Melhoria 2 - Features de interacao
+# ---------------------------------------------------------------------------
+secao("40. MELHORIA 2 - FEATURES DE INTERACAO")
+
+col_bairro_base = "bairro_target_enc" if "bairro_target_enc" in X_train_melhoria1.columns else "bairro_freq_enc"
+print(f"Coluna usada como base de 'preco_m2_estimado': {col_bairro_base}")
+
+
+def adicionar_features_interacao(X):
+    X = X.copy()
+    X["preco_m2_estimado"] = X[col_bairro_base]
+    X["quartos_x_area"] = X["quartos"] * X["log_area_util"]
+    X["vagas_x_area"] = X["vagas"] * X["log_area_util"]
+    X["suites_ratio_quartos"] = X["suites"] / (X["quartos"] + 1)
+    X["luxo_x_area"] = X["total_amenidades"] * X["log_area_util"]
+    for col_tipo in colunas_tipo:  # ['tipo_Apartamento', 'tipo_Casa', 'tipo_Loft', 'tipo_Quitinete']
+        X[f"{col_tipo}_x_area"] = X[col_tipo] * X["log_area_util"]
+    return X
+
+
+rmspe_base_m2 = tab_bairro.iloc[0]["rmspe_medio"]
+std_base_m2 = tab_bairro.iloc[0]["rmspe_std"]
+print(f"Base (encoding vencedor da melhoria 1, reaproveitado): RMSPE = {rmspe_base_m2:.4f} +/- {std_base_m2:.4f}")
+
+X_train_m2_extra = adicionar_features_interacao(X_train_melhoria1)
+X_test_m2_extra = adicionar_features_interacao(X_test_melhoria1)
+
+scores_m2_extra = cv_rmspe_catboost(X_train_m2_extra, y_train)
+print(f"Com features de interacao:                             RMSPE = {scores_m2_extra.mean():.4f} +/- {scores_m2_extra.std():.4f}")
+
+melhorou_melhoria2 = scores_m2_extra.mean() < rmspe_base_m2
+print(f"\nMelhoria 2 {'MELHOROU' if melhorou_melhoria2 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria2:
+    X_train_melhoria2, X_test_melhoria2 = X_train_m2_extra, X_test_m2_extra
+    rmspe_melhoria2, std_melhoria2 = float(scores_m2_extra.mean()), float(scores_m2_extra.std())
+else:
+    X_train_melhoria2, X_test_melhoria2 = X_train_melhoria1, X_test_melhoria1
+    rmspe_melhoria2, std_melhoria2 = float(rmspe_base_m2), float(std_base_m2)
+
+
+# ---------------------------------------------------------------------------
+# 41. Melhoria 3 - Remocao mais agressiva de outliers (percentil 99)
+# ---------------------------------------------------------------------------
+secao("41. MELHORIA 3 - REMOCAO MAIS AGRESSIVA DE OUTLIERS (PERCENTIL 99)")
+
+p99_log = y_train.quantile(0.99)
+mask_p99 = y_train <= p99_log
+n_removidos_p99 = int((~mask_p99).sum())
+
+X_train_p99 = X_train_melhoria2.loc[mask_p99].reset_index(drop=True)
+y_train_p99 = y_train.loc[mask_p99].reset_index(drop=True)
+
+print(f"Percentil 99 de log_preco (dados ja sem outliers IQR): {p99_log:.4f}  (preco ~ R$ {np.expm1(p99_log):,.2f})")
+print(f"Imoveis adicionais removidos (acima do p99): {n_removidos_p99}")
+print(f"Treino: {len(y_train)} -> {len(y_train_p99)} imoveis")
+
+scores_p99 = cv_rmspe_catboost(X_train_p99, y_train_p99)
+
+print(f"\nRMSPE com outliers removidos via IQR (3x) apenas (melhoria 2, reaproveitado): {rmspe_melhoria2:.4f} +/- {std_melhoria2:.4f}")
+print(f"RMSPE com corte adicional no percentil 99:                                    {scores_p99.mean():.4f} +/- {scores_p99.std():.4f}")
+
+melhorou_melhoria3 = scores_p99.mean() < rmspe_melhoria2
+print(f"\nMelhoria 3 {'MELHOROU' if melhorou_melhoria3 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria3:
+    X_train_melhoria3, y_train_melhoria3 = X_train_p99, y_train_p99
+    rmspe_melhoria3, std_melhoria3 = float(scores_p99.mean()), float(scores_p99.std())
+else:
+    X_train_melhoria3, y_train_melhoria3 = X_train_melhoria2, y_train
+    rmspe_melhoria3, std_melhoria3 = rmspe_melhoria2, std_melhoria2
+
+
+# ---------------------------------------------------------------------------
+# 42. Resumo das tentativas e geracao de novas submissoes
+# ---------------------------------------------------------------------------
+secao("42. RESUMO DAS TENTATIVAS E GERACAO DE NOVAS SUBMISSOES")
+
+
+def gerar_submissao_blend(X_tr, y_tr, X_te, nome_arquivo):
+    """Blend de 5 seeds x 3 modelos (LGBM, XGB, CatBoost) no dataset completo fornecido."""
+    previsoes = []
+    for seed in seeds_submissao:
+        for nome, modelo in criar_modelos_otimizados(seed=seed).items():
+            modelo.fit(X_tr, y_tr)
+            previsoes.append(modelo.predict(X_te))
+    pred_log_media = np.mean(previsoes, axis=0)
+    preco_pred = np.clip(np.expm1(pred_log_media), PRECO_MINIMO, None)
+    sub = pd.DataFrame({"Id": test_ids, "preco": preco_pred})
+    sub.to_csv(nome_arquivo, index=False)
+    print(f"Submissao salva em '{nome_arquivo}' ({len(sub)} linhas).")
+    return sub
+
+
+tentativas = [
+    {"versao": "v1 (baseline, blend/voting secao 36)", "rmspe_cv": 0.2333, "melhorou": "-", "arquivo": "submissao_kaggle.csv"},
+    {"versao": f"v2 (melhoria 1: {variante_vencedora})", "rmspe_cv": float(tab_bairro.iloc[0]["rmspe_medio"]), "melhorou": melhorou_melhoria1, "arquivo": None},
+    {"versao": "v3 (melhoria 2: features de interacao)", "rmspe_cv": rmspe_melhoria2, "melhorou": melhorou_melhoria2, "arquivo": None},
+    {"versao": "v4 (melhoria 3: corte p99)", "rmspe_cv": rmspe_melhoria3, "melhorou": melhorou_melhoria3, "arquivo": None},
+]
+
+candidatos_submissao = [
+    (X_train_melhoria1, y_train, X_test_melhoria1),
+    (X_train_melhoria2, y_train, X_test_melhoria2),
+    (X_train_melhoria3, y_train_melhoria3, X_test_melhoria2),
+]
+
+contador_versao = 2
+alguma_melhoria_gerou_submissao = False
+for tentativa, (X_tr_cand, y_tr_cand, X_te_cand) in zip(tentativas[1:], candidatos_submissao):
+    if tentativa["melhorou"]:
+        nome_arquivo = f"submissao_v{contador_versao}.csv"
+        gerar_submissao_blend(X_tr_cand, y_tr_cand, X_te_cand, nome_arquivo)
+        tentativa["arquivo"] = nome_arquivo
+        alguma_melhoria_gerou_submissao = True
+    else:
+        print(f"{tentativa['versao']}: nao melhorou o CV -- submissao NAO gerada.")
+    contador_versao += 1
+
+if not alguma_melhoria_gerou_submissao:
+    print("\nNenhuma das 3 melhorias superou o CV baseline; 'submissao_kaggle.csv' (v1) permanece a melhor.")
+
+tab_tentativas = pd.DataFrame(tentativas)
+print("\nResumo de todas as tentativas:")
+print(tab_tentativas.to_string(index=False))
+
+print("\nIteracao de melhorias concluida.")
