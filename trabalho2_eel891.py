@@ -8,21 +8,24 @@ aproximada, a RMSE em log(preco).
 
 EDA (secoes 1-12) + pre-processamento/feature engineering/tratamento de
 outliers (secoes 13-23) + baselines de modelagem com 5-fold CV avaliados
-por RMSPE, com e sem outliers (secoes 24-27).
+por RMSPE, com e sem outliers (secoes 24-27) + otimizacao de
+hiperparametros com Optuna para LightGBM/XGBoost/CatBoost (secoes 28-32).
 """
 
+import json
 import pickle
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import optuna
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import Lasso, LinearRegression, Ridge
 from sklearn.metrics import make_scorer
-from sklearn.model_selection import KFold, cross_val_score
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from xgboost import XGBRegressor
 
 pd.set_option("display.max_columns", None)
@@ -726,3 +729,181 @@ print(
 )
 
 print("\nModelagem baseline concluida (com e sem tratamento de outliers).")
+
+
+# ---------------------------------------------------------------------------
+# 28. Optuna - setup (split 80/20 estratificado por faixas de log_preco)
+# ---------------------------------------------------------------------------
+secao("28. OPTUNA - SETUP")
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Licao do Trabalho 1: split 80/20 simples + ~50 trials generalizou melhor no Kaggle
+# do que buscas mais longas com 5-fold CV completo por trial.
+bins_estratificacao = pd.qcut(y_train, q=5, labels=False)
+X_opt_treino, X_opt_val, y_opt_treino, y_opt_val = train_test_split(
+    X_train, y_train, test_size=0.2, random_state=42, stratify=bins_estratificacao
+)
+
+print(f"Split 80/20 estratificado por faixas de log_preco (5 bins via pd.qcut):")
+print(f"  treino (80%)    : {X_opt_treino.shape}")
+print(f"  validacao (20%) : {X_opt_val.shape}")
+
+
+def avaliar_rmspe_val(modelo):
+    """Treina no 80%, preve no 20% e calcula RMSPE no espaco original (expm1)."""
+    modelo.fit(X_opt_treino, y_opt_treino)
+    pred_log = modelo.predict(X_opt_val)
+    return rmspe(y_opt_val, pred_log)
+
+
+print("Funcao avaliar_rmspe_val() definida (treina 80%, avalia RMSPE no 20% restante).")
+
+
+# ---------------------------------------------------------------------------
+# 29. Optuna - LightGBM (50 trials)
+# ---------------------------------------------------------------------------
+secao("29. OPTUNA - LIGHTGBM (50 TRIALS)")
+
+
+def objetivo_lgbm(trial):
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 200, 1500),
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "num_leaves": trial.suggest_int("num_leaves", 8, 127),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+        "subsample": trial.suggest_float("subsample", 0.4, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        "random_state": 42,
+        "verbose": -1,
+    }
+    return avaliar_rmspe_val(LGBMRegressor(**params))
+
+
+study_lgbm = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_lgbm.optimize(objetivo_lgbm, n_trials=50, show_progress_bar=True)
+
+print(f"\nMelhor RMSPE (validacao 20%) - LightGBM: {study_lgbm.best_value:.4f}")
+print("Melhores parametros:")
+for k, v in study_lgbm.best_params.items():
+    print(f"  {k}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# 30. Optuna - XGBoost (50 trials)
+# ---------------------------------------------------------------------------
+secao("30. OPTUNA - XGBOOST (50 TRIALS)")
+
+
+def objetivo_xgb(trial):
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 200, 1500),
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+        "subsample": trial.suggest_float("subsample", 0.4, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        "random_state": 42,
+        "verbosity": 0,
+    }
+    return avaliar_rmspe_val(XGBRegressor(**params))
+
+
+study_xgb = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_xgb.optimize(objetivo_xgb, n_trials=50, show_progress_bar=True)
+
+print(f"\nMelhor RMSPE (validacao 20%) - XGBoost: {study_xgb.best_value:.4f}")
+print("Melhores parametros:")
+for k, v in study_xgb.best_params.items():
+    print(f"  {k}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# 31. Optuna - CatBoost (30 trials, mais lento)
+# ---------------------------------------------------------------------------
+secao("31. OPTUNA - CATBOOST (30 TRIALS)")
+
+
+def objetivo_catboost(trial):
+    params = {
+        "iterations": trial.suggest_int("iterations", 200, 1000),
+        "depth": trial.suggest_int("depth", 3, 10),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10.0, log=True),
+        "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        "random_strength": trial.suggest_float("random_strength", 1e-8, 10.0, log=True),
+        "random_seed": 42,
+        "verbose": 0,
+    }
+    return avaliar_rmspe_val(CatBoostRegressor(**params))
+
+
+study_catboost = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_catboost.optimize(objetivo_catboost, n_trials=30, show_progress_bar=True)
+
+print(f"\nMelhor RMSPE (validacao 20%) - CatBoost: {study_catboost.best_value:.4f}")
+print("Melhores parametros:")
+for k, v in study_catboost.best_params.items():
+    print(f"  {k}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# 32. Resultados da otimizacao
+# ---------------------------------------------------------------------------
+secao("32. RESULTADOS DA OTIMIZACAO")
+
+studies = {
+    "LGBMRegressor": (study_lgbm, "best_lgbm.json"),
+    "XGBRegressor": (study_xgb, "best_xgb.json"),
+    "CatBoostRegressor": (study_catboost, "best_catboost.json"),
+}
+
+for nome, (study, arquivo) in studies.items():
+    with open(arquivo, "w") as f:
+        json.dump(study.best_params, f, indent=2)
+    print(f"Parametros de {nome} salvos em '{arquivo}' (best_value={study.best_value:.4f})")
+
+# Confirmar com 5-fold CV nos dados limpos (sem outliers), usando os melhores params encontrados
+modelos_otimizados = {
+    "LGBMRegressor": LGBMRegressor(**study_lgbm.best_params, random_state=42, verbose=-1),
+    "XGBRegressor": XGBRegressor(**study_xgb.best_params, random_state=42, verbosity=0),
+    "CatBoostRegressor": CatBoostRegressor(**study_catboost.best_params, random_seed=42, verbose=0),
+}
+
+print("\nConfirmando com 5-fold CV (dados sem outliers):")
+resultados_otimizados = []
+for nome, modelo in modelos_otimizados.items():
+    scores = cross_val_score(modelo, X_train, y_train, cv=kf, scoring=rmspe_scorer, n_jobs=1)
+    rmspe_scores = -scores
+    media = rmspe_scores.mean()
+    desvio = rmspe_scores.std()
+    resultados_otimizados.append({"modelo": nome, "rmspe_medio": media, "rmspe_std": desvio})
+    print(f"{nome:28s} RMSPE = {media:.4f} +/- {desvio:.4f}")
+
+tab_otimizados = pd.DataFrame(resultados_otimizados)
+
+# Tabela comparativa: baseline default (secao 25, sem outliers) vs otimizado (Optuna)
+comparacao_final = (
+    tab_resultados[tab_resultados["modelo"].isin(modelos_otimizados.keys())][["modelo", "rmspe_medio"]]
+    .rename(columns={"rmspe_medio": "rmspe_baseline_default"})
+    .merge(
+        tab_otimizados[["modelo", "rmspe_medio"]].rename(columns={"rmspe_medio": "rmspe_otimizado"}),
+        on="modelo",
+    )
+)
+comparacao_final["melhora_%"] = (
+    1 - comparacao_final["rmspe_otimizado"] / comparacao_final["rmspe_baseline_default"]
+) * 100
+comparacao_final = comparacao_final.sort_values("rmspe_otimizado").reset_index(drop=True)
+comparacao_final.index += 1
+
+print("\nComparacao: baseline default (5-fold CV) vs otimizado via Optuna (5-fold CV), dados sem outliers:")
+print(comparacao_final.to_string())
+
+print("\nOtimizacao de hiperparametros concluida.")
