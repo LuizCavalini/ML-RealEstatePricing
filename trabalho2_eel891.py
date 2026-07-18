@@ -16,10 +16,13 @@ corte de outliers mais agressivo, com novas submissoes (secoes 39-42) +
 segunda rodada: re-otimizacao Optuna no dataset v4, weighted blending e
 features extras do texto 'diferenciais' (secoes 43-46) + terceira rodada:
 stacking com meta-learner, LOO target encoding do bairro, features de
-preco por m2 e binning de numericas (secoes 47-51).
+preco por m2 e binning de numericas (secoes 47-51) + quarta rodada (final):
+blending de submissoes ja geradas, feature selection e mais seeds no
+blend, com submissoes finais (secoes 52-56).
 """
 
 import json
+import os
 import pickle
 
 import numpy as np
@@ -2051,3 +2054,257 @@ print("\nResumo de TODAS as tentativas (v1-v8):")
 print(tab_tentativas_final.to_string(index=False))
 
 print("\nTerceira rodada de melhorias concluida.")
+
+
+# ---------------------------------------------------------------------------
+# 52. Melhoria 11 - Blending de submissoes (media dos CSVs)
+# ---------------------------------------------------------------------------
+secao("52. MELHORIA 11 - BLENDING DE SUBMISSOES (MEDIA DOS CSVS)")
+
+print("IMPORTANTE: o teste nao tem preco conhecido (e o que o Kaggle avalia) -- esta secao NAO")
+print("pode validar via RMSPE local. Os arquivos gerados aqui precisam ser submetidos ao Kaggle")
+print("para comparar de fato. Os scores entre parenteses sao os ja reportados pelo usuario,")
+print("usados so para escolher os 'top 3'.\n")
+
+
+def validar_formato_submissao(sub, nome_arquivo):
+    assert list(sub.columns) == list(exemplo.columns), f"{nome_arquivo}: colunas nao batem com o exemplo!"
+    assert sub.shape[0] == exemplo.shape[0], f"{nome_arquivo}: numero de linhas nao bate com o exemplo!"
+    assert sub["Id"].isin(exemplo["Id"]).all(), f"{nome_arquivo}: ha Ids que nao existem no exemplo!"
+    assert sub["Id"].is_unique, f"{nome_arquivo}: ha Ids duplicados!"
+
+
+def blend_log(dfs, ids_referencia):
+    """Media no espaco log1p(preco) -> expm1 (mais robusto para RMSPE que media direta)."""
+    logs = [np.log1p(df.set_index("Id").reindex(ids_referencia)["preco"]) for df in dfs]
+    log_medio = pd.concat(logs, axis=1).mean(axis=1)
+    preco_medio = np.expm1(log_medio)
+    return pd.DataFrame({"Id": ids_referencia, "preco": preco_medio.values})
+
+
+# 1. Carregar as submissoes existentes
+SUBMISSOES_CANDIDATAS = {
+    "v4": ("submissao_v4.csv", 0.2479),
+    "v5": ("submissao_v5.csv", 0.2469),
+    "v6": ("submissao_v6.csv", 0.2469),
+    "v8": ("submissao_v8.csv", 0.2471),
+    "otimizada_local": ("submissao_otimizada_local.csv", None),
+}
+
+submissoes_carregadas = {}
+for nome, (arquivo, score_kaggle) in SUBMISSOES_CANDIDATAS.items():
+    if os.path.exists(arquivo):
+        df = pd.read_csv(arquivo)
+        submissoes_carregadas[nome] = {"df": df, "score_kaggle": score_kaggle}
+        sufixo = f", score Kaggle={score_kaggle}" if score_kaggle is not None else " (sem score Kaggle conhecido)"
+        print(f"Carregado: {arquivo} ({len(df)} linhas){sufixo}")
+    else:
+        print(f"Nao encontrado: {arquivo} -- pulando.")
+
+nomes_disponiveis = list(submissoes_carregadas.keys())
+test_ids_ref = submissoes_carregadas[nomes_disponiveis[0]]["df"]["Id"].values
+
+# 2. Diagnostico par-a-par (nao ha RMSPE local possivel; correlacao serve de proxy de diversidade)
+print("\nDiagnostico par-a-par (correlacao entre log(preco), diferenca percentual media absoluta):")
+for i in range(len(nomes_disponiveis)):
+    for j in range(i + 1, len(nomes_disponiveis)):
+        a, b = nomes_disponiveis[i], nomes_disponiveis[j]
+        preco_a = submissoes_carregadas[a]["df"].set_index("Id")["preco"].reindex(test_ids_ref)
+        preco_b = submissoes_carregadas[b]["df"].set_index("Id")["preco"].reindex(test_ids_ref)
+        corr = float(np.corrcoef(np.log1p(preco_a), np.log1p(preco_b))[0, 1])
+        diff_pct = float((np.abs(preco_a - preco_b) / preco_a).mean() * 100)
+        print(f"  {a:20s} vs {b:20s}  corr(log)={corr:.4f}  dif_%_media={diff_pct:.2f}%")
+
+# 4. Blend v5 + v8
+if "v5" in submissoes_carregadas and "v8" in submissoes_carregadas:
+    sub_v5v8 = blend_log([submissoes_carregadas["v5"]["df"], submissoes_carregadas["v8"]["df"]], test_ids_ref)
+    validar_formato_submissao(sub_v5v8, "submissao_blend_v5v8.csv")
+    sub_v5v8.to_csv("submissao_blend_v5v8.csv", index=False)
+    print("\nSubmissao salva em 'submissao_blend_v5v8.csv' (media log de v5 e v8).")
+else:
+    print("\nv5 e/ou v8 nao disponiveis -- 'submissao_blend_v5v8.csv' NAO gerada.")
+
+# 5. Blend de todas as submissoes disponiveis
+dfs_todas = [v["df"] for v in submissoes_carregadas.values()]
+sub_all = blend_log(dfs_todas, test_ids_ref)
+validar_formato_submissao(sub_all, "submissao_blend_all.csv")
+sub_all.to_csv("submissao_blend_all.csv", index=False)
+print(f"Submissao salva em 'submissao_blend_all.csv' (media log de {len(dfs_todas)} submissoes: {nomes_disponiveis}).")
+
+# 6. Blend das 3 melhores por score Kaggle conhecido
+com_score = {k: v for k, v in submissoes_carregadas.items() if v["score_kaggle"] is not None}
+top3_nomes = sorted(com_score, key=lambda k: com_score[k]["score_kaggle"])[:3]
+dfs_top3 = [submissoes_carregadas[n]["df"] for n in top3_nomes]
+sub_top3 = blend_log(dfs_top3, test_ids_ref)
+validar_formato_submissao(sub_top3, "submissao_blend_top3.csv")
+sub_top3.to_csv("submissao_blend_top3.csv", index=False)
+print(f"Submissao salva em 'submissao_blend_top3.csv' (media log de {top3_nomes}, os 3 melhores scores Kaggle conhecidos).")
+
+
+# ---------------------------------------------------------------------------
+# 53. Melhoria 12 - Feature selection (remover ruido)
+# ---------------------------------------------------------------------------
+secao("53. MELHORIA 12 - FEATURE SELECTION (REMOVER RUIDO)")
+
+# 1. Treinar CatBoost otimizado no dataset atual (vencedor acumulado das melhorias 1-10)
+modelo_fs = CatBoostRegressor(**params_catboost_final, random_seed=42, verbose=0)
+modelo_fs.fit(X_train_m10_win, y_train_m6)
+
+# 2. Extrair feature_importances_
+importancias = pd.Series(modelo_fs.feature_importances_, index=X_train_m10_win.columns)
+importancias_pct = importancias / importancias.sum() * 100
+tab_importancias = importancias_pct.sort_values(ascending=False)
+print("Importancia das features (% do total, CatBoost):")
+print(tab_importancias.to_string())
+
+# 3. Testar remocao das features com importancia < 1% do total
+features_baixa_importancia = tab_importancias[tab_importancias < 1.0].index.tolist()
+features_selecionadas = [c for c in X_train_m10_win.columns if c not in features_baixa_importancia]
+
+print(f"\nFeatures com importancia < 1% ({len(features_baixa_importancia)}): {features_baixa_importancia}")
+print(f"Features selecionadas (>= 1%): {len(features_selecionadas)} de {X_train_m10_win.shape[1]}")
+
+X_train_fs = X_train_m10_win[features_selecionadas]
+X_test_fs = X_test_m10_win[features_selecionadas]
+
+# 4. Comparar via 5-fold CV: todas as features vs selecionadas
+scores_todas_features = cv_rmspe_catboost_final(X_train_m10_win, y_train_m6)
+scores_selecionadas = cv_rmspe_catboost_final(X_train_fs, y_train_m6)
+
+print(f"\nTodas as features ({X_train_m10_win.shape[1]}):     RMSPE = {scores_todas_features.mean():.4f} +/- {scores_todas_features.std():.4f}")
+print(f"Features selecionadas ({len(features_selecionadas)}):  RMSPE = {scores_selecionadas.mean():.4f} +/- {scores_selecionadas.std():.4f}")
+
+melhorou_melhoria12 = bool(scores_selecionadas.mean() < scores_todas_features.mean())
+empatou_melhoria12 = bool(scores_selecionadas.mean() == scores_todas_features.mean())
+melhorou_ou_empatou_melhoria12 = melhorou_melhoria12 or empatou_melhoria12
+veredito_m12 = "MELHOROU" if melhorou_melhoria12 else ("EMPATOU" if empatou_melhoria12 else "NAO melhorou")
+print(f"\nMelhoria 12 {veredito_m12} o RMSPE.")
+
+if melhorou_ou_empatou_melhoria12:
+    X_train_m12_win, X_test_m12_win = X_train_fs, X_test_fs
+    rmspe_melhoria12, std_melhoria12 = float(scores_selecionadas.mean()), float(scores_selecionadas.std())
+else:
+    X_train_m12_win, X_test_m12_win = X_train_m10_win, X_test_m10_win
+    rmspe_melhoria12, std_melhoria12 = float(scores_todas_features.mean()), float(scores_todas_features.std())
+
+
+# ---------------------------------------------------------------------------
+# 54. Melhoria 13 - Mais seeds no blend (10 vs 5)
+# ---------------------------------------------------------------------------
+secao("54. MELHORIA 13 - MAIS SEEDS NO BLEND (10 VS 5)")
+
+SEEDS_10 = seeds_submissao + [7777, 31415, 271828, 8888, 555]
+N_SEEDS_MENOR = len(seeds_submissao)
+
+print(f"Comparando blend de {N_SEEDS_MENOR} seeds ({N_SEEDS_MENOR * 3} modelos) vs "
+      f"{len(SEEDS_10)} seeds ({len(SEEDS_10) * 3} modelos), via 5-fold CV no dataset atual.")
+print("(Computacionalmente pesado: 5 folds x 10 seeds x 3 modelos = 150 fits; os 5-seed sao")
+print("reaproveitados como subconjunto dos 10-seed, para nao treinar os mesmos modelos 2x.)")
+
+scores_5seeds_fold = []
+scores_10seeds_fold = []
+for idx_tr, idx_val in kf.split(X_train_m12_win):
+    X_tr = X_train_m12_win.iloc[idx_tr]
+    X_val = X_train_m12_win.iloc[idx_val]
+    y_tr = y_train_m6.iloc[idx_tr]
+    y_val = y_train_m6.iloc[idx_val]
+
+    preds_por_seed = []
+    for seed in SEEDS_10:
+        modelos_seed = {
+            "LGBMRegressor": LGBMRegressor(**params_lgbm_final, random_state=seed, verbose=-1),
+            "XGBRegressor": XGBRegressor(**params_xgb_final, random_state=seed, verbosity=0),
+            "CatBoostRegressor": CatBoostRegressor(**params_catboost_final, random_seed=seed, verbose=0),
+        }
+        for modelo in modelos_seed.values():
+            modelo.fit(X_tr, y_tr)
+            preds_por_seed.append(modelo.predict(X_val))
+
+    preds_por_seed = np.array(preds_por_seed)
+    pred_5seeds = preds_por_seed[: N_SEEDS_MENOR * 3].mean(axis=0)
+    pred_10seeds = preds_por_seed.mean(axis=0)
+    scores_5seeds_fold.append(rmspe(y_val, pred_5seeds))
+    scores_10seeds_fold.append(rmspe(y_val, pred_10seeds))
+
+scores_5seeds_fold = np.array(scores_5seeds_fold)
+scores_10seeds_fold = np.array(scores_10seeds_fold)
+
+print(f"\nBlend {N_SEEDS_MENOR} seeds ({N_SEEDS_MENOR * 3} modelos):  RMSPE = {scores_5seeds_fold.mean():.4f} +/- {scores_5seeds_fold.std():.4f}")
+print(f"Blend {len(SEEDS_10)} seeds ({len(SEEDS_10) * 3} modelos): RMSPE = {scores_10seeds_fold.mean():.4f} +/- {scores_10seeds_fold.std():.4f}")
+
+melhorou_melhoria13 = bool(scores_10seeds_fold.mean() < scores_5seeds_fold.mean())
+empatou_melhoria13 = bool(scores_10seeds_fold.mean() == scores_5seeds_fold.mean())
+melhorou_ou_empatou_melhoria13 = melhorou_melhoria13 or empatou_melhoria13
+veredito_m13 = "MELHOROU" if melhorou_melhoria13 else ("EMPATOU" if empatou_melhoria13 else "NAO melhorou")
+print(f"\nMelhoria 13 {veredito_m13} o RMSPE.")
+
+
+# ---------------------------------------------------------------------------
+# 55. Gerar submissoes finais (melhorias 12 e 13)
+# ---------------------------------------------------------------------------
+secao("55. GERAR SUBMISSOES FINAIS (MELHORIAS 12 E 13)")
+
+pesos_finais_v9 = pesos if melhorou_melhoria5 else None
+if melhorou_ou_empatou_melhoria12:
+    gerar_submissao_blend_v2(
+        X_train_m12_win, y_train_m6, X_test_m12_win,
+        "submissao_v9.csv", params_lgbm_final, params_xgb_final, params_catboost_final,
+        pesos_uso=pesos_finais_v9,
+    )
+    arquivo_v9 = "submissao_v9.csv"
+else:
+    print("Melhoria 12 (feature selection) piorou -- 'submissao_v9.csv' NAO gerada.")
+    arquivo_v9 = None
+
+if melhorou_ou_empatou_melhoria13:
+    previsoes_10seeds_final = []
+    for seed in SEEDS_10:
+        modelos_seed = {
+            "LGBMRegressor": LGBMRegressor(**params_lgbm_final, random_state=seed, verbose=-1),
+            "XGBRegressor": XGBRegressor(**params_xgb_final, random_state=seed, verbosity=0),
+            "CatBoostRegressor": CatBoostRegressor(**params_catboost_final, random_seed=seed, verbose=0),
+        }
+        for nome, modelo in modelos_seed.items():
+            modelo.fit(X_train_m12_win, y_train_m6)
+            previsoes_10seeds_final.append(modelo.predict(X_test_m12_win))
+    pred_log_media_10 = np.mean(previsoes_10seeds_final, axis=0)
+    preco_10 = np.clip(np.expm1(pred_log_media_10), PRECO_MINIMO, None)
+    sub_v10 = pd.DataFrame({"Id": test_ids, "preco": preco_10})
+    validar_formato_submissao(sub_v10, "submissao_v10.csv")
+    sub_v10.to_csv("submissao_v10.csv", index=False)
+    print(f"Submissao salva em 'submissao_v10.csv' ({len(sub_v10)} linhas) -- blend de {len(SEEDS_10)} seeds ({len(SEEDS_10) * 3} modelos).")
+    arquivo_v10 = "submissao_v10.csv"
+else:
+    print("Melhoria 13 (10 seeds) nao melhorou nem empatou -- 'submissao_v10.csv' NAO gerada.")
+    arquivo_v10 = None
+
+
+# ---------------------------------------------------------------------------
+# 56. Resumo final de todas as tentativas
+# ---------------------------------------------------------------------------
+secao("56. RESUMO FINAL DE TODAS AS TENTATIVAS (V1-V10 + BLENDS)")
+
+quarta_rodada = pd.DataFrame(
+    [
+        {"versao": "v9 (melhoria 12: feature selection)", "rmspe_cv": rmspe_melhoria12, "melhorou": melhorou_ou_empatou_melhoria12, "arquivo": arquivo_v9},
+        {
+            "versao": "v10 (melhoria 13: 10 seeds no blend)",
+            "rmspe_cv": float(scores_10seeds_fold.mean()) if melhorou_ou_empatou_melhoria13 else float(scores_5seeds_fold.mean()),
+            "melhorou": melhorou_ou_empatou_melhoria13,
+            "arquivo": arquivo_v10,
+        },
+        {"versao": "blend_v5v8 (melhoria 11)", "rmspe_cv": np.nan, "melhorou": "requer Kaggle", "arquivo": "submissao_blend_v5v8.csv"},
+        {"versao": "blend_all (melhoria 11)", "rmspe_cv": np.nan, "melhorou": "requer Kaggle", "arquivo": "submissao_blend_all.csv"},
+        {"versao": "blend_top3 (melhoria 11)", "rmspe_cv": np.nan, "melhorou": "requer Kaggle", "arquivo": "submissao_blend_top3.csv"},
+    ]
+)
+print(quarta_rodada.to_string(index=False))
+
+print("\nNota: blends de submissoes (melhoria 11) operam sobre previsoes de TESTE, que nao tem")
+print("preco conhecido -- por isso rmspe_cv fica NaN para eles; so o Kaggle pode avalia-los.")
+
+tab_tentativas_geral = pd.concat([tab_tentativas_final, quarta_rodada], ignore_index=True)
+print("\nResumo de TODAS as tentativas do trabalho (v1-v10 + blends de submissoes):")
+print(tab_tentativas_geral.to_string(index=False))
+
+print("\nQuarta e ultima rodada de melhorias concluida.")
