@@ -21,7 +21,9 @@ blending de submissoes ja geradas, feature selection e mais seeds no
 blend, com submissoes finais (secoes 52-56) + quinta rodada (final):
 diversidade de modelos (lineares, KNN, bagging), ensemble diverso com
 pesos otimizados e re-otimizacao do CatBoost direto no 5-fold CV
-(secoes 57-64).
+(secoes 57-64) + sexta rodada (final): combinacao dos melhores params
+com pesos otimizados (restricao explicita), multi-seed nos pesos e
+regularizacao L2 dos pesos (secoes 65-69).
 """
 
 import json
@@ -2793,4 +2795,256 @@ tab_tentativas_diversidade = pd.concat([tab_tentativas_geral, resumo_diversidade
 print("\nResumo de TODAS as tentativas do trabalho (v1-v11 + blends + diversidade):")
 print(tab_tentativas_diversidade.to_string(index=False))
 
-print("\nQuinta e ultima rodada de melhorias (diversidade) concluida.")
+print("\nQuinta rodada de melhorias (diversidade) concluida.")
+
+
+# ---------------------------------------------------------------------------
+# 65. Melhoria 17 - Pesos otimizados com os melhores params (restricao explicita)
+# ---------------------------------------------------------------------------
+secao("65. MELHORIA 17 - PESOS OTIMIZADOS COM OS MELHORES PARAMS (RESTRICAO EXPLICITA)")
+
+print("Contexto (scores reais no Kaggle, reportados pelo usuario):")
+print("  otimizacao_local.py sozinho (150/150/80 trials): 0.2437")
+print("  Pesos otimizados sobre 8 modelos diversos (v10):  0.2393")
+print("Os dois ja usam os params do otimizacao_local.py (best_*_local.json) -- o pool de 8")
+print("modelos e o OOF (oof_todos) das secoes 57-60 sao reaproveitados aqui, sem novos fits.")
+print("A diferenca desta secao e usar um solver com restricoes EXPLICITAS (pesos >= 0, soma = 1,")
+print("via SLSQP) em vez da reparametrizacao abs()/soma usada na secao 61 (melhoria 15).\n")
+
+print(f"Pool reaproveitado (8 modelos): {list(oof_todos.columns)}")
+print(f"OOF shape: {oof_todos.shape}")
+
+
+def objetivo_pesos_restrito(pesos, oof_matrix, y_true):
+    pred = oof_matrix.values @ pesos
+    return rmspe(y_true, pred)
+
+
+n_modelos_v12 = oof_todos.shape[1]
+pesos_iniciais_v12 = np.ones(n_modelos_v12) / n_modelos_v12
+restricao_soma_1 = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+limites_v12 = [(0.0, 1.0)] * n_modelos_v12
+
+resultado_opt_restrito = minimize(
+    objetivo_pesos_restrito, pesos_iniciais_v12, args=(oof_todos, y_div_train),
+    method="SLSQP", bounds=limites_v12, constraints=[restricao_soma_1],
+    options={"maxiter": 1000, "ftol": 1e-10},
+)
+pesos_restritos_dict = dict(zip(oof_todos.columns, resultado_opt_restrito.x))
+
+print("\nPesos otimizados (SLSQP, restricao explicita w>=0, soma(w)=1):")
+for nome, peso in sorted(pesos_restritos_dict.items(), key=lambda x: -x[1]):
+    print(f"  {nome:24s} peso = {peso:.4f}")
+
+scores_pesos_restritos = rmspe_fold_wise_pesos(pesos_restritos_dict, X_div_train, y_div_train, oof_todos)
+print(f"\nRMSPE (5-fold CV, pesos restritos, SLSQP): {scores_pesos_restritos.mean():.4f} +/- {scores_pesos_restritos.std():.4f}")
+print(f"RMSPE anterior (secao 61, mesmos params locais, reparam. abs/soma): {scores_pesos_otimizados.mean():.4f} +/- {scores_pesos_otimizados.std():.4f}")
+
+melhorou_melhoria17 = bool(scores_pesos_restritos.mean() < scores_pesos_otimizados.mean())
+print(f"\nMelhoria 17 {'MELHOROU' if melhorou_melhoria17 else 'NAO melhorou'} sobre a otimizacao anterior (secao 61).")
+
+if melhorou_melhoria17:
+    pesos_v12_dict = pesos_restritos_dict
+    rmspe_melhoria17, std_melhoria17 = float(scores_pesos_restritos.mean()), float(scores_pesos_restritos.std())
+else:
+    pesos_v12_dict = pesos_otimizados_dict
+    rmspe_melhoria17, std_melhoria17 = float(scores_pesos_otimizados.mean()), float(scores_pesos_otimizados.std())
+
+
+# ---------------------------------------------------------------------------
+# 66. Melhoria 18 - Multi-seed nos pesos otimizados
+# ---------------------------------------------------------------------------
+secao("66. MELHORIA 18 - MULTI-SEED NOS PESOS OTIMIZADOS")
+
+SEEDS_MULTISEED = [42, 123, 2026]
+
+
+def criar_pool_multiseed():
+    """3 boosters x 3 seeds (9 modelos) + RF/ET/Ridge/ElasticNet/KNN (seed=42) = 14 modelos."""
+    modelos = {}
+    for seed in SEEDS_MULTISEED:
+        for nome, modelo in criar_boosters_local(seed=seed).items():
+            modelos[f"{nome}_seed{seed}"] = modelo
+    modelos["RandomForestRegressor"] = RandomForestRegressor(**params_rf_local, random_state=42, n_jobs=1)
+    modelos["ExtraTreesRegressor"] = ExtraTreesRegressor(**params_et_local, random_state=42, n_jobs=1)
+    modelos["Ridge"] = Pipeline(
+        [("scaler", StandardScaler()), ("ridge", Ridge(alpha=melhor_alpha_ridge, random_state=42))]
+    )
+    modelos["ElasticNet"] = Pipeline(
+        [("scaler", StandardScaler()),
+         ("elasticnet", ElasticNet(alpha=melhor_alpha_en, l1_ratio=melhor_l1_ratio_en, max_iter=5000, random_state=42))]
+    )
+    modelos["KNeighborsRegressor"] = Pipeline(
+        [("scaler", StandardScaler()), ("knn", KNeighborsRegressor(n_neighbors=melhor_n_neighbors))]
+    )
+    return modelos
+
+
+pool_multiseed_exemplo = criar_pool_multiseed()
+print(f"Pool expandido: {len(pool_multiseed_exemplo)} modelos (3 boosters x 3 seeds + RF + ET + Ridge + ElasticNet + KNN)")
+
+oof_multiseed, tab_multiseed = gerar_oof_com_scores(pool_multiseed_exemplo, X_div_train, y_div_train)
+print("\nRMSPE individual (14 modelos, 5-fold CV):")
+print(tab_multiseed.to_string())
+
+n_modelos_v13 = oof_multiseed.shape[1]
+pesos_iniciais_v13 = np.ones(n_modelos_v13) / n_modelos_v13
+limites_v13 = [(0.0, 1.0)] * n_modelos_v13
+
+resultado_opt_multiseed = minimize(
+    objetivo_pesos_restrito, pesos_iniciais_v13, args=(oof_multiseed, y_div_train),
+    method="SLSQP", bounds=limites_v13, constraints=[restricao_soma_1],
+    options={"maxiter": 1000, "ftol": 1e-10},
+)
+pesos_multiseed_dict = dict(zip(oof_multiseed.columns, resultado_opt_multiseed.x))
+
+print("\nPesos otimizados (14 modelos, multi-seed) -- so pesos > 0.01%:")
+for nome, peso in sorted(pesos_multiseed_dict.items(), key=lambda x: -x[1]):
+    if peso > 1e-4:
+        print(f"  {nome:24s} peso = {peso:.4f}")
+
+scores_pesos_multiseed = rmspe_fold_wise_pesos(pesos_multiseed_dict, X_div_train, y_div_train, oof_multiseed)
+print(f"\nRMSPE (5-fold CV, 14 modelos multi-seed): {scores_pesos_multiseed.mean():.4f} +/- {scores_pesos_multiseed.std():.4f}")
+print(f"RMSPE (8 modelos, melhoria 17): {rmspe_melhoria17:.4f} +/- {std_melhoria17:.4f}")
+
+melhorou_melhoria18 = bool(scores_pesos_multiseed.mean() < rmspe_melhoria17)
+print(f"\nMelhoria 18 {'MELHOROU' if melhorou_melhoria18 else 'NAO melhorou'} sobre o pool de 8 (melhoria 17).")
+
+
+# ---------------------------------------------------------------------------
+# 67. Melhoria 19 - Regularizacao dos pesos (L2)
+# ---------------------------------------------------------------------------
+secao("67. MELHORIA 19 - REGULARIZACAO DOS PESOS (L2)")
+
+if melhorou_melhoria18:
+    oof_base_m19 = oof_multiseed
+    rmspe_base_m19 = float(scores_pesos_multiseed.mean())
+    pool_nome_m19 = "14 modelos (multi-seed, melhoria 18)"
+else:
+    oof_base_m19 = oof_todos
+    rmspe_base_m19 = rmspe_melhoria17
+    pool_nome_m19 = "8 modelos (melhoria 17)"
+
+print(f"Pool base para regularizacao: {pool_nome_m19} (RMSPE sem regularizacao: {rmspe_base_m19:.4f})")
+
+
+def objetivo_pesos_regularizado(pesos, oof_matrix, y_true, lam):
+    pred = oof_matrix.values @ pesos
+    return rmspe(y_true, pred) + lam * np.sum(pesos ** 2)
+
+
+n_modelos_m19 = oof_base_m19.shape[1]
+pesos_iniciais_m19 = np.ones(n_modelos_m19) / n_modelos_m19
+limites_m19 = [(0.0, 1.0)] * n_modelos_m19
+
+resultados_lambda = []
+pesos_por_lambda = {}
+for lam in [0, 0.001, 0.01, 0.1]:
+    resultado_lam = minimize(
+        objetivo_pesos_regularizado, pesos_iniciais_m19, args=(oof_base_m19, y_div_train, lam),
+        method="SLSQP", bounds=limites_m19, constraints=[restricao_soma_1],
+        options={"maxiter": 1000, "ftol": 1e-10},
+    )
+    pesos_lam_dict = dict(zip(oof_base_m19.columns, resultado_lam.x))
+    scores_lam = rmspe_fold_wise_pesos(pesos_lam_dict, X_div_train, y_div_train, oof_base_m19)
+    resultados_lambda.append({"lambda": lam, "rmspe_medio": scores_lam.mean(), "rmspe_std": scores_lam.std()})
+    pesos_por_lambda[lam] = pesos_lam_dict
+    print(f"lambda={lam:<7} RMSPE = {scores_lam.mean():.4f} +/- {scores_lam.std():.4f}")
+
+tab_lambda = pd.DataFrame(resultados_lambda).sort_values("rmspe_medio").reset_index(drop=True)
+tab_lambda.index += 1
+print("\nRanking por lambda:")
+print(tab_lambda.to_string())
+
+melhor_lambda = tab_lambda.iloc[0]["lambda"]
+rmspe_melhor_lambda = float(tab_lambda.iloc[0]["rmspe_medio"])
+std_melhor_lambda = float(tab_lambda.iloc[0]["rmspe_std"])
+pesos_melhor_lambda_dict = pesos_por_lambda[melhor_lambda]
+
+print(f"\nMelhor lambda: {melhor_lambda} (RMSPE={rmspe_melhor_lambda:.4f})")
+melhorou_melhoria19 = bool(rmspe_melhor_lambda < rmspe_base_m19)
+print(f"Melhoria 19 {'MELHOROU' if melhorou_melhoria19 else 'NAO melhorou'} sobre o pool sem regularizacao "
+      f"(lambda=0 e um dos candidatos testados, entao no minimo empata).")
+
+
+# ---------------------------------------------------------------------------
+# 68. Gerar submissoes (v12 pesos restritos, v13 multi-seed, v14 regularizado)
+# ---------------------------------------------------------------------------
+secao("68. GERAR SUBMISSOES (V12, V13, V14)")
+
+
+def gerar_submissao_pesos(modelos_dict, pesos_dict, X_tr, y_tr, X_te, nome_arquivo):
+    """Treina todos os modelos do dict no treino completo, preve teste, aplica os pesos,
+    converte para preco via expm1 e clipa o minimo."""
+    preds = {}
+    for nome, modelo in modelos_dict.items():
+        modelo.fit(X_tr, y_tr)
+        preds[nome] = modelo.predict(X_te)
+    preds_df = pd.DataFrame(preds)[list(pesos_dict.keys())]
+    pred_log = (preds_df * pd.Series(pesos_dict)).sum(axis=1).values
+    preco = np.clip(np.expm1(pred_log), PRECO_MINIMO, None)
+    sub = pd.DataFrame({"Id": test_ids, "preco": preco})
+    validar_formato_submissao(sub, nome_arquivo)
+    sub.to_csv(nome_arquivo, index=False)
+    print(f"Submissao salva em '{nome_arquivo}' ({len(sub)} linhas).")
+    return sub
+
+
+if melhorou_melhoria17:
+    gerar_submissao_pesos(criar_pool_diverso(seed=42), pesos_v12_dict, X_div_train, y_div_train, X_div_test, "submissao_v12.csv")
+    arquivo_v12 = "submissao_v12.csv"
+else:
+    print(f"Melhoria 17 nao superou a otimizacao anterior (secao 61) -- 'submissao_v12.csv' NAO gerada.")
+    arquivo_v12 = None
+
+if melhorou_melhoria18:
+    gerar_submissao_pesos(criar_pool_multiseed(), pesos_multiseed_dict, X_div_train, y_div_train, X_div_test, "submissao_v13.csv")
+    arquivo_v13 = "submissao_v13.csv"
+else:
+    print("Melhoria 18 (multi-seed) nao melhorou -- 'submissao_v13.csv' NAO gerada.")
+    arquivo_v13 = None
+
+if melhorou_melhoria19:
+    pool_final_m19 = criar_pool_multiseed() if melhorou_melhoria18 else criar_pool_diverso(seed=42)
+    gerar_submissao_pesos(pool_final_m19, pesos_melhor_lambda_dict, X_div_train, y_div_train, X_div_test, "submissao_v14.csv")
+    arquivo_v14 = "submissao_v14.csv"
+else:
+    print("Melhoria 19 (regularizacao) nao melhorou -- 'submissao_v14.csv' NAO gerada.")
+    arquivo_v14 = None
+
+
+# ---------------------------------------------------------------------------
+# 69. Resumo final - combinacao de pesos otimizados
+# ---------------------------------------------------------------------------
+secao("69. RESUMO FINAL - COMBINACAO DE PESOS OTIMIZADOS")
+
+print("Pesos finais (melhoria 17, pool de 8):")
+for nome, peso in sorted(pesos_v12_dict.items(), key=lambda x: -x[1]):
+    print(f"  {nome:24s} peso = {peso:.4f}")
+
+if melhorou_melhoria18:
+    print("\nPesos finais (melhoria 18, pool de 14, multi-seed, so pesos > 0.01%):")
+    for nome, peso in sorted(pesos_multiseed_dict.items(), key=lambda x: -x[1]):
+        if peso > 1e-4:
+            print(f"  {nome:24s} peso = {peso:.4f}")
+
+print(f"\nPesos finais (melhoria 19, lambda={melhor_lambda}, so pesos > 0.01%):")
+for nome, peso in sorted(pesos_melhor_lambda_dict.items(), key=lambda x: -x[1]):
+    if peso > 1e-4:
+        print(f"  {nome:24s} peso = {peso:.4f}")
+
+resumo_pesos = pd.DataFrame(
+    [
+        {"versao": "v12 (melhoria 17: pesos restritos, 8 modelos)", "rmspe_cv": rmspe_melhoria17, "melhorou": melhorou_melhoria17, "arquivo": arquivo_v12},
+        {"versao": "v13 (melhoria 18: multi-seed, 14 modelos)", "rmspe_cv": float(scores_pesos_multiseed.mean()), "melhorou": melhorou_melhoria18, "arquivo": arquivo_v13},
+        {"versao": f"v14 (melhoria 19: regularizacao L2, lambda={melhor_lambda})", "rmspe_cv": rmspe_melhor_lambda, "melhorou": melhorou_melhoria19, "arquivo": arquivo_v14},
+    ]
+)
+print("\nResumo desta rodada (melhorias 17-19):")
+print(resumo_pesos.to_string(index=False))
+
+tab_tentativas_pesos = pd.concat([tab_tentativas_diversidade, resumo_pesos], ignore_index=True)
+print("\nResumo de TODAS as tentativas do trabalho (v1-v14 + blends + diversidade + pesos):")
+print(tab_tentativas_pesos.to_string(index=False))
+
+print("\nSexta e ultima rodada de melhorias (combinacao de pesos) concluida.")
