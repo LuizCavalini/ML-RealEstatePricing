@@ -397,21 +397,21 @@ A Figura~\ref{fig:importance} apresenta a importância das 20 \textit{features} 
     \rowcolor{headerblue}
     \color{white}\textbf{\#} & \color{white}\textbf{\textit{Feature}} & \color{white}\textbf{Importância} \\
     \midrule
-    1  & \code{vagas\_x\_area} (engenharia)             & $\approx$20\% \\
-    2  & \code{quartos\_x\_area} (engenharia)            & $\approx$12\% \\
-    3  & \code{luxo\_x\_area} (engenharia)               & $\approx$7\% \\
-    4  & \code{bairro\_freq\_enc} (\textit{encoding})    & $\approx$7\% \\
-    5  & \code{suites\_ratio\_quartos} (engenharia)      & $\approx$6\% \\
-    6  & \code{tipo\_Apartamento\_x\_area} (engenharia)  & $\approx$6\% \\
-    7  & \code{bairro\_target\_enc} (\textit{encoding})  & $\approx$6\% \\
-    8  & \code{preco\_m2\_estimado} (engenharia)         & $\approx$6\% \\
-    9  & \code{area\_por\_quarto} (engenharia)           & $\approx$6\% \\
-    10 & \code{proporcao\_suites} (engenharia)           & $\approx$5\% \\
+    1  & \code{vagas\_x\_area} (engenharia)              & 19,2\% \\
+    2  & \code{log\_preco\_m2\_estimado} (engenharia)    & 8,8\% \\
+    3  & \code{preco\_m2\_estimado} (engenharia)         & 8,4\% \\
+    4  & \code{quartos\_x\_area} (engenharia)            & 7,6\% \\
+    5  & \code{bairro\_target\_enc} (\textit{encoding})  & 6,3\% \\
+    6  & \code{luxo\_x\_area} (engenharia)               & 6,3\% \\
+    7  & \code{bairro\_preco\_m2} (engenharia)           & 5,7\% \\
+    8  & \code{suites\_ratio\_quartos} (engenharia)      & 5,5\% \\
+    9  & \code{bairro\_freq\_enc} (\textit{encoding})    & 5,4\% \\
+    10 & \code{tipo\_Apartamento\_x\_area} (engenharia)  & 5,1\% \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Destaca-se que \textbf{todas} as 10 \textit{features} mais importantes foram criadas na etapa de engenharia de \textit{features} ou de \textit{encoding} (Seções~\ref{sec:features} e~\ref{sec:encoding}) --- nenhuma variável original bruta aparece no topo, validando fortemente o investimento nessas etapas. A variável \code{vagas\_x\_area} isoladamente concentra cerca de 20\% da importância total, sugerindo que a interação entre vagas de garagem e área do imóvel é o sinal mais forte disponível para prever o preço.
+Destaca-se que \textbf{todas} as 10 \textit{features} mais importantes foram criadas na etapa de engenharia de \textit{features} ou de \textit{encoding} (Seções~\ref{sec:features} e~\ref{sec:encoding}) --- nenhuma variável original bruta aparece no topo, validando fortemente o investimento nessas etapas. A variável \code{vagas\_x\_area} isoladamente concentra quase 20\% (19,2\%) da importância total, sugerindo que a interação entre vagas de garagem e área do imóvel é o sinal mais forte disponível para prever o preço. Chama atenção também que \textbf{três} das dez posições (\code{log\_preco\_m2\_estimado}, \code{preco\_m2\_estimado} e \code{bairro\_preco\_m2}) pertencem à família de \textit{features} de preço por m² descrita na Seção~\ref{sec:features} --- reforçando que essa estimativa informada por localização e tamanho é, de fato, um dos sinais mais úteis do modelo.
 
 \begin{figure}[H]
   \centering
