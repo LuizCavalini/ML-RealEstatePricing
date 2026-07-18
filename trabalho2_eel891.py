@@ -16,9 +16,12 @@ corte de outliers mais agressivo, com novas submissoes (secoes 39-42) +
 segunda rodada: re-otimizacao Optuna no dataset v4, weighted blending e
 features extras do texto 'diferenciais' (secoes 43-46) + terceira rodada:
 stacking com meta-learner, LOO target encoding do bairro, features de
-preco por m2 e binning de numericas (secoes 47-51) + quarta rodada (final):
+preco por m2 e binning de numericas (secoes 47-51) + quarta rodada:
 blending de submissoes ja geradas, feature selection e mais seeds no
-blend, com submissoes finais (secoes 52-56).
+blend, com submissoes finais (secoes 52-56) + quinta rodada (final):
+diversidade de modelos (lineares, KNN, bagging), ensemble diverso com
+pesos otimizados e re-otimizacao do CatBoost direto no 5-fold CV
+(secoes 57-64).
 """
 
 import json
@@ -32,10 +35,14 @@ import seaborn as sns
 import optuna
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Lasso, LinearRegression, Ridge
+from scipy.optimize import minimize
+from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import ElasticNet, ElasticNetCV, Lasso, LinearRegression, Ridge, RidgeCV
 from sklearn.metrics import make_scorer
-from sklearn.model_selection import KFold, cross_val_score, train_test_split
+from sklearn.model_selection import GridSearchCV, KFold, cross_val_score, train_test_split
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 pd.set_option("display.max_columns", None)
@@ -2307,4 +2314,483 @@ tab_tentativas_geral = pd.concat([tab_tentativas_final, quarta_rodada], ignore_i
 print("\nResumo de TODAS as tentativas do trabalho (v1-v10 + blends de submissoes):")
 print(tab_tentativas_geral.to_string(index=False))
 
-print("\nQuarta e ultima rodada de melhorias concluida.")
+print("\nQuarta rodada de melhorias concluida.")
+
+
+# ---------------------------------------------------------------------------
+# 57. Melhoria 14 - Setup (params locais + dataset v4 completo)
+# ---------------------------------------------------------------------------
+secao("57. MELHORIA 14 - SETUP")
+
+print("Diagnostico: LGBM/XGB/CatBoost tem correlacao > 0.998 entre si (todos gradient boosting")
+print("sobre as mesmas features) -- o ensemble ganha pouco porque os 3 erram nos mesmos lugares.")
+print("Esta rodada busca DIVERSIDADE: modelos com vies estrutural diferente (linear, vizinhanca,")
+print("bagging), cujos erros tendem a ser menos correlacionados.\n")
+
+with open("best_lgbm_local.json") as f:
+    params_lgbm_local = json.load(f)
+with open("best_xgb_local.json") as f:
+    params_xgb_local = json.load(f)
+with open("best_catboost_local.json") as f:
+    params_catboost_local = json.load(f)
+
+print("Params carregados de best_lgbm_local.json / best_xgb_local.json / best_catboost_local.json")
+print("(150/150/80 trials do otimizacao_local.py -- melhores que os 50/50/30 trials da secao 43).")
+
+X_div_train = X_train_m12_win
+X_div_test = X_test_m12_win
+y_div_train = y_train_m6
+
+print(f"\nDataset v4 completo (TE smoothed+freq + interacoes + preco/m2 + corte p99):")
+print(f"  X_train={X_div_train.shape}  X_test={X_div_test.shape}")
+
+
+def criar_boosters_local(seed=42):
+    return {
+        "LGBMRegressor": LGBMRegressor(**params_lgbm_local, random_state=seed, verbose=-1),
+        "XGBRegressor": XGBRegressor(**params_xgb_local, random_state=seed, verbosity=0),
+        "CatBoostRegressor": CatBoostRegressor(**params_catboost_local, random_seed=seed, verbose=0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 58. Melhoria 14 - Otimizar modelos lineares e KNN (via CV)
+# ---------------------------------------------------------------------------
+secao("58. MELHORIA 14 - OTIMIZAR RIDGE, ELASTICNET E KNN (VIA CV)")
+
+# Modelos lineares/KNN sao sensiveis a escala -- StandardScaler dentro de um Pipeline garante
+# que o scaler e ajustado so no treino de cada fold (sem vazar estatisticas do fold de validacao).
+
+# 1. Ridge: alpha otimizado por CV (RidgeCV aceita scoring customizado -- usamos o rmspe_scorer)
+pipeline_ridge = Pipeline([
+    ("scaler", StandardScaler()),
+    ("ridge", RidgeCV(alphas=np.logspace(-3, 3, 25), scoring=rmspe_scorer, cv=kf)),
+])
+pipeline_ridge.fit(X_div_train, y_div_train)
+melhor_alpha_ridge = float(pipeline_ridge.named_steps["ridge"].alpha_)
+print(f"Ridge: melhor alpha (CV, {len(np.logspace(-3, 3, 25))} candidatos) = {melhor_alpha_ridge:.4f}")
+
+# 2. ElasticNet: alpha e l1_ratio otimizados por CV (ElasticNetCV nao aceita scorer customizado;
+# usa MSE no espaco log, um proxy razoavel dado que o alvo ja e log1p(preco))
+pipeline_elasticnet = Pipeline([
+    ("scaler", StandardScaler()),
+    ("elasticnet", ElasticNetCV(
+        alphas=np.logspace(-3, 1, 15),
+        l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0],
+        cv=kf, max_iter=5000, random_state=42,
+    )),
+])
+pipeline_elasticnet.fit(X_div_train, y_div_train)
+melhor_alpha_en = float(pipeline_elasticnet.named_steps["elasticnet"].alpha_)
+melhor_l1_ratio_en = float(pipeline_elasticnet.named_steps["elasticnet"].l1_ratio_)
+print(f"ElasticNet: melhor alpha={melhor_alpha_en:.4f}  l1_ratio={melhor_l1_ratio_en:.4f}")
+
+# 3. KNN: n_neighbors otimizado via GridSearchCV com o rmspe_scorer
+pipeline_knn_base = Pipeline([
+    ("scaler", StandardScaler()),
+    ("knn", KNeighborsRegressor()),
+])
+grid_knn = GridSearchCV(
+    pipeline_knn_base,
+    param_grid={"knn__n_neighbors": [5, 10, 15, 20, 30, 50, 75]},
+    scoring=rmspe_scorer, cv=kf, n_jobs=1,
+)
+grid_knn.fit(X_div_train, y_div_train)
+melhor_n_neighbors = int(grid_knn.best_params_["knn__n_neighbors"])
+print(f"KNeighborsRegressor: melhor n_neighbors (CV) = {melhor_n_neighbors}")
+
+
+# ---------------------------------------------------------------------------
+# 59. Melhoria 14 - Otimizar RandomForest e ExtraTrees (Optuna, split 80/20)
+# ---------------------------------------------------------------------------
+secao("59. MELHORIA 14 - OTIMIZAR RANDOMFOREST E EXTRATREES (OPTUNA)")
+
+bins_div = pd.qcut(y_div_train, q=5, labels=False)
+X_div_opt_treino, X_div_opt_val, y_div_opt_treino, y_div_opt_val = train_test_split(
+    X_div_train, y_div_train, test_size=0.2, random_state=42, stratify=bins_div
+)
+
+
+def avaliar_rmspe_val_diverso(modelo):
+    modelo.fit(X_div_opt_treino, y_div_opt_treino)
+    pred_log = modelo.predict(X_div_opt_val)
+    return rmspe(y_div_opt_val, pred_log)
+
+
+def objetivo_rf(trial):
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+        "max_depth": trial.suggest_int("max_depth", 4, 25),
+        "min_samples_split": trial.suggest_int("min_samples_split", 2, 30),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 20),
+        "max_features": trial.suggest_float("max_features", 0.3, 1.0),
+        "random_state": 42,
+        "n_jobs": 1,
+    }
+    return avaliar_rmspe_val_diverso(RandomForestRegressor(**params))
+
+
+study_rf = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_rf.optimize(objetivo_rf, n_trials=25, show_progress_bar=True)
+print(f"\nMelhor RMSPE (validacao 20%) - RandomForest: {study_rf.best_value:.4f}")
+params_rf_local = study_rf.best_params
+
+
+def objetivo_et(trial):
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+        "max_depth": trial.suggest_int("max_depth", 4, 25),
+        "min_samples_split": trial.suggest_int("min_samples_split", 2, 30),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 20),
+        "max_features": trial.suggest_float("max_features", 0.3, 1.0),
+        "random_state": 42,
+        "n_jobs": 1,
+    }
+    return avaliar_rmspe_val_diverso(ExtraTreesRegressor(**params))
+
+
+study_et = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_et.optimize(objetivo_et, n_trials=25, show_progress_bar=True)
+print(f"\nMelhor RMSPE (validacao 20%) - ExtraTrees: {study_et.best_value:.4f}")
+params_et_local = study_et.best_params
+
+
+def criar_pool_diverso(seed=42):
+    """Pool com os 3 boosters (params do otimizacao_local) + 5 modelos nao-boosting."""
+    modelos = dict(criar_boosters_local(seed=seed))
+    modelos["Ridge"] = Pipeline(
+        [("scaler", StandardScaler()), ("ridge", Ridge(alpha=melhor_alpha_ridge, random_state=seed))]
+    )
+    modelos["ElasticNet"] = Pipeline(
+        [("scaler", StandardScaler()),
+         ("elasticnet", ElasticNet(alpha=melhor_alpha_en, l1_ratio=melhor_l1_ratio_en, max_iter=5000, random_state=seed))]
+    )
+    modelos["KNeighborsRegressor"] = Pipeline(
+        [("scaler", StandardScaler()), ("knn", KNeighborsRegressor(n_neighbors=melhor_n_neighbors))]
+    )
+    modelos["RandomForestRegressor"] = RandomForestRegressor(**params_rf_local, random_state=seed, n_jobs=1)
+    modelos["ExtraTreesRegressor"] = ExtraTreesRegressor(**params_et_local, random_state=seed, n_jobs=1)
+    return modelos
+
+
+# ---------------------------------------------------------------------------
+# 60. Melhoria 14 - Avaliacao individual (5-fold CV) e matriz de correlacao OOF
+# ---------------------------------------------------------------------------
+secao("60. MELHORIA 14 - AVALIACAO INDIVIDUAL E MATRIZ DE CORRELACAO OOF")
+
+
+def gerar_oof_com_scores(modelos_dict, X, y):
+    """OOF previsoes + RMSPE por fold, para um dict {nome: modelo}, mesmo 'kf' do script.
+
+    Uma unica passada de treino serve tanto para a tabela de RMSPE individual quanto para a
+    matriz de correlacao das previsoes -- evita treinar cada modelo duas vezes.
+    """
+    oof = {nome: np.zeros(len(X)) for nome in modelos_dict}
+    scores_por_modelo = {nome: [] for nome in modelos_dict}
+    for idx_tr, idx_val in kf.split(X):
+        X_tr, y_tr = X.iloc[idx_tr], y.iloc[idx_tr]
+        X_val, y_val = X.iloc[idx_val], y.iloc[idx_val]
+        for nome, modelo in modelos_dict.items():
+            modelo.fit(X_tr, y_tr)
+            pred = modelo.predict(X_val)
+            oof[nome][idx_val] = pred
+            scores_por_modelo[nome].append(rmspe(y_val, pred))
+    oof_df = pd.DataFrame(oof)
+    resultados = pd.DataFrame(
+        [{"modelo": nome, "rmspe_medio": np.mean(s), "rmspe_std": np.std(s)} for nome, s in scores_por_modelo.items()]
+    ).sort_values("rmspe_medio").reset_index(drop=True)
+    resultados.index += 1
+    return oof_df, resultados
+
+
+oof_todos, tab_diversos = gerar_oof_com_scores(criar_pool_diverso(seed=42), X_div_train, y_div_train)
+print("Ranking dos 8 modelos (3 boosters + 5 diversos), 5-fold CV:")
+print(tab_diversos.to_string())
+
+matriz_correlacao = oof_todos.corr()
+print("\nMatriz de correlacao das previsoes OOF (todos os modelos):")
+print(matriz_correlacao.round(4).to_string())
+
+
+# ---------------------------------------------------------------------------
+# 61. Melhoria 15 - Ensemble diverso
+# ---------------------------------------------------------------------------
+secao("61. MELHORIA 15 - ENSEMBLE DIVERSO")
+
+
+def rmspe_fold_wise_media(nomes_modelos, X, y, oof_df):
+    """RMSPE por fold a partir da MEDIA das colunas de oof_df (reutiliza OOF ja calculado)."""
+    scores = []
+    for _, idx_val in kf.split(X):
+        pred_fold = oof_df.loc[idx_val, nomes_modelos].mean(axis=1)
+        scores.append(rmspe(y.iloc[idx_val], pred_fold))
+    return np.array(scores)
+
+
+def rmspe_fold_wise_pesos(pesos_dict, X, y, oof_df):
+    """RMSPE por fold a partir de uma combinacao PESADA das colunas de oof_df."""
+    pesos_serie = pd.Series(pesos_dict)
+    scores = []
+    for _, idx_val in kf.split(X):
+        pred_fold = (oof_df.loc[idx_val, pesos_serie.index] * pesos_serie).sum(axis=1)
+        scores.append(rmspe(y.iloc[idx_val], pred_fold))
+    return np.array(scores)
+
+
+# Referencia: blend uniforme so dos 3 boosters (params locais, dataset v4 completo -- base
+# diferente da citada pelo usuario, 0.2220, que usava os params/dataset da secao 43)
+scores_3_boosters = rmspe_fold_wise_media(
+    ["LGBMRegressor", "XGBRegressor", "CatBoostRegressor"], X_div_train, y_div_train, oof_todos
+)
+print(f"Blend so dos 3 boosters (uniforme, params locais, dataset v4 completo): "
+      f"RMSPE = {scores_3_boosters.mean():.4f} +/- {scores_3_boosters.std():.4f}")
+print("(Referencia citada pelo usuario, com params/dataset da secao 43: 0.2220)")
+
+# 1. Blend do CatBoost + os 2-3 modelos MENOS correlacionados com ele
+corr_catboost = matriz_correlacao["CatBoostRegressor"].drop("CatBoostRegressor").sort_values()
+print("\nCorrelacao de cada modelo com o CatBoost (OOF), do menos ao mais correlacionado:")
+print(corr_catboost.to_string())
+
+menos_correlacionados = corr_catboost.index[:3].tolist()
+modelos_blend_diverso = ["CatBoostRegressor"] + menos_correlacionados
+print(f"\nPool do blend diverso: {modelos_blend_diverso}")
+
+scores_blend_diverso = rmspe_fold_wise_media(modelos_blend_diverso, X_div_train, y_div_train, oof_todos)
+print(f"Blend diverso (CatBoost + 3 menos correlacionados): RMSPE = {scores_blend_diverso.mean():.4f} +/- {scores_blend_diverso.std():.4f}")
+
+# 2. Stacking (Ridge meta-learner) sobre TODOS os modelos diversos
+scores_stacking_diverso = -cross_val_score(
+    Ridge(alpha=1.0), oof_todos, y_div_train, cv=kf, scoring=rmspe_scorer, n_jobs=1
+)
+print(f"\nStacking diverso (Ridge sobre OOF dos 8 modelos): RMSPE = {scores_stacking_diverso.mean():.4f} +/- {scores_stacking_diverso.std():.4f}")
+
+# 3. Pesos otimizados via scipy.optimize (minimiza RMSPE diretamente no OOF).
+# CUIDADO: os pesos sao otimizados sobre o MESMO OOF que depois usamos para reportar o RMSPE
+# fold-a-fold -- ha um otimismo residual (mesma ressalva ja feita para o stacking, secao 47),
+# mas como sao so 8 pesos (poucos graus de liberdade), o overfitting tende a ser pequeno.
+print("\nOtimizando pesos do blend via scipy.optimize (minimiza RMSPE no OOF)...")
+
+
+def objetivo_pesos(pesos_raw, oof_matrix, y_true):
+    pesos_abs = np.abs(pesos_raw)
+    pesos_norm = pesos_abs / pesos_abs.sum()
+    pred = oof_matrix.values @ pesos_norm
+    return rmspe(y_true, pred)
+
+
+n_modelos_pool = oof_todos.shape[1]
+pesos_iniciais = np.ones(n_modelos_pool) / n_modelos_pool
+resultado_opt = minimize(
+    objetivo_pesos, pesos_iniciais, args=(oof_todos, y_div_train),
+    method="Nelder-Mead", options={"maxiter": 3000, "xatol": 1e-6, "fatol": 1e-8},
+)
+pesos_otimizados_raw = np.abs(resultado_opt.x)
+pesos_otimizados = pesos_otimizados_raw / pesos_otimizados_raw.sum()
+pesos_otimizados_dict = dict(zip(oof_todos.columns, pesos_otimizados))
+
+print("Pesos otimizados:")
+for nome, peso in sorted(pesos_otimizados_dict.items(), key=lambda x: -x[1]):
+    print(f"  {nome:24s} peso = {peso:.4f}")
+
+scores_pesos_otimizados = rmspe_fold_wise_pesos(pesos_otimizados_dict, X_div_train, y_div_train, oof_todos)
+print(f"\nBlend com pesos otimizados: RMSPE = {scores_pesos_otimizados.mean():.4f} +/- {scores_pesos_otimizados.std():.4f}")
+
+# 4. Comparar tudo
+comparacao_diversidade = pd.DataFrame(
+    [
+        {"abordagem": "3 boosters apenas (uniforme)", "rmspe_medio": scores_3_boosters.mean(), "rmspe_std": scores_3_boosters.std()},
+        {"abordagem": f"Blend diverso (CatBoost + {menos_correlacionados})", "rmspe_medio": scores_blend_diverso.mean(), "rmspe_std": scores_blend_diverso.std()},
+        {"abordagem": "Stacking diverso (Ridge sobre 8 OOF)", "rmspe_medio": scores_stacking_diverso.mean(), "rmspe_std": scores_stacking_diverso.std()},
+        {"abordagem": "Pesos otimizados (scipy, 8 modelos)", "rmspe_medio": scores_pesos_otimizados.mean(), "rmspe_std": scores_pesos_otimizados.std()},
+    ]
+).sort_values("rmspe_medio").reset_index(drop=True)
+comparacao_diversidade.index += 1
+print("\nComparacao final (melhoria 15):")
+print(comparacao_diversidade.to_string())
+
+melhor_abordagem_diversidade = comparacao_diversidade.iloc[0]["abordagem"]
+rmspe_melhor_diversidade = float(comparacao_diversidade.iloc[0]["rmspe_medio"])
+melhorou_melhoria15 = bool(rmspe_melhor_diversidade < scores_3_boosters.mean())
+print(f"\nMelhor abordagem: {melhor_abordagem_diversidade} (RMSPE={rmspe_melhor_diversidade:.4f})")
+print(f"Melhoria 15 {'MELHOROU' if melhorou_melhoria15 else 'NAO melhorou'} sobre o blend so dos 3 boosters.")
+
+
+# ---------------------------------------------------------------------------
+# 62. Melhoria 16 - Optuna direto no 5-fold CV (CatBoost, 40 trials)
+# ---------------------------------------------------------------------------
+secao("62. MELHORIA 16 - OPTUNA DIRETO NO 5-FOLD CV (CATBOOST, 40 TRIALS)")
+
+print("Os params atuais (best_catboost_local.json) foram otimizados num unico split 80/20")
+print("(ruidoso). Testando re-otimizar usando 5-fold CV como objetivo -- mais lento por trial")
+print("(5x o custo), mas os params encontrados devem ser mais estaveis/generalizaveis.\n")
+
+
+def objetivo_catboost_5fold(trial):
+    params = {
+        "iterations": trial.suggest_int("iterations", 200, 1000),
+        "depth": trial.suggest_int("depth", 3, 10),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10.0, log=True),
+        "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        "random_strength": trial.suggest_float("random_strength", 1e-8, 10.0, log=True),
+        "random_seed": 42,
+        "verbose": 0,
+    }
+    scores = cross_val_score(
+        CatBoostRegressor(**params), X_div_train, y_div_train, cv=kf, scoring=rmspe_scorer, n_jobs=1
+    )
+    return -scores.mean()
+
+
+study_catboost_5fold = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+study_catboost_5fold.optimize(objetivo_catboost_5fold, n_trials=40, show_progress_bar=True)
+
+print(f"\nMelhor RMSPE (5-fold CV) - CatBoost re-otimizado: {study_catboost_5fold.best_value:.4f}")
+print("Melhores parametros:")
+for k, v in study_catboost_5fold.best_params.items():
+    print(f"  {k}: {v}")
+
+scores_catboost_local_5fold = -cross_val_score(
+    CatBoostRegressor(**params_catboost_local, random_seed=42, verbose=0), X_div_train, y_div_train,
+    cv=kf, scoring=rmspe_scorer, n_jobs=1,
+)
+scores_catboost_5fold_novo = -cross_val_score(
+    CatBoostRegressor(**study_catboost_5fold.best_params, random_seed=42, verbose=0), X_div_train, y_div_train,
+    cv=kf, scoring=rmspe_scorer, n_jobs=1,
+)
+
+print(f"\nCatBoost (params do local, split 80/20):        RMSPE (5-fold CV) = {scores_catboost_local_5fold.mean():.4f} +/- {scores_catboost_local_5fold.std():.4f}")
+print(f"CatBoost (re-otimizado direto no 5-fold CV):    RMSPE (5-fold CV) = {scores_catboost_5fold_novo.mean():.4f} +/- {scores_catboost_5fold_novo.std():.4f}")
+
+melhorou_melhoria16 = bool(scores_catboost_5fold_novo.mean() < scores_catboost_local_5fold.mean())
+print(f"\nMelhoria 16 {'MELHOROU' if melhorou_melhoria16 else 'NAO melhorou'} o RMSPE.")
+
+if melhorou_melhoria16:
+    params_catboost_5fold_final = study_catboost_5fold.best_params
+    rmspe_melhoria16, std_melhoria16 = float(scores_catboost_5fold_novo.mean()), float(scores_catboost_5fold_novo.std())
+else:
+    params_catboost_5fold_final = params_catboost_local
+    rmspe_melhoria16, std_melhoria16 = float(scores_catboost_local_5fold.mean()), float(scores_catboost_local_5fold.std())
+
+
+# ---------------------------------------------------------------------------
+# 63. Gerar submissoes (v9 ensemble diverso, v10 pesos otimizados, v11 optuna 5-fold)
+# ---------------------------------------------------------------------------
+secao("63. GERAR SUBMISSOES (V9, V10, V11)")
+
+
+def prever_blend_diverso(nomes_modelos, X_tr, y_tr, X_te, seed=42):
+    modelos = criar_pool_diverso(seed=seed)
+    preds = [modelos[nome].fit(X_tr, y_tr).predict(X_te) for nome in nomes_modelos]
+    return np.mean(preds, axis=0)
+
+
+def prever_stacking_diverso(X_tr, y_tr, X_te, seed=42):
+    meta_treino, _ = gerar_oof_com_scores(criar_pool_diverso(seed=seed), X_tr, y_tr)
+    meta_learner_diverso = Ridge(alpha=1.0)
+    meta_learner_diverso.fit(meta_treino, y_tr)
+
+    modelos_teste = criar_pool_diverso(seed=seed)
+    meta_teste = {nome: modelo.fit(X_tr, y_tr).predict(X_te) for nome, modelo in modelos_teste.items()}
+    meta_teste_df = pd.DataFrame(meta_teste)[meta_treino.columns]
+    return meta_learner_diverso.predict(meta_teste_df)
+
+
+def prever_pesos_otimizados(pesos_dict, X_tr, y_tr, X_te, seed=42):
+    modelos = criar_pool_diverso(seed=seed)
+    preds = {nome: modelo.fit(X_tr, y_tr).predict(X_te) for nome, modelo in modelos.items()}
+    preds_df = pd.DataFrame(preds)[list(pesos_dict.keys())]
+    return (preds_df * pd.Series(pesos_dict)).sum(axis=1).values
+
+
+# v9: melhor ensemble diverso "simples" (blend diverso ou stacking diverso, o que for melhor)
+if scores_blend_diverso.mean() <= scores_stacking_diverso.mean():
+    nome_v9, rmspe_v9_candidato = f"Blend diverso ({modelos_blend_diverso})", float(scores_blend_diverso.mean())
+else:
+    nome_v9, rmspe_v9_candidato = "Stacking diverso (Ridge sobre 8 OOF)", float(scores_stacking_diverso.mean())
+
+melhorou_v9 = bool(rmspe_v9_candidato < scores_3_boosters.mean())
+if melhorou_v9:
+    if scores_blend_diverso.mean() <= scores_stacking_diverso.mean():
+        pred_log_v9 = prever_blend_diverso(modelos_blend_diverso, X_div_train, y_div_train, X_div_test)
+    else:
+        pred_log_v9 = prever_stacking_diverso(X_div_train, y_div_train, X_div_test)
+    preco_v9 = np.clip(np.expm1(pred_log_v9), PRECO_MINIMO, None)
+    sub_v9 = pd.DataFrame({"Id": test_ids, "preco": preco_v9})
+    validar_formato_submissao(sub_v9, "submissao_v9.csv")
+    sub_v9.to_csv("submissao_v9.csv", index=False)
+    print(f"Submissao salva em 'submissao_v9.csv' -- {nome_v9} (RMSPE={rmspe_v9_candidato:.4f}).")
+    arquivo_v9_diverso = "submissao_v9.csv"
+else:
+    print(f"Melhor ensemble diverso simples ({nome_v9}, RMSPE={rmspe_v9_candidato:.4f}) nao supera "
+          f"os 3 boosters (RMSPE={scores_3_boosters.mean():.4f}) -- 'submissao_v9.csv' NAO gerada.")
+    arquivo_v9_diverso = None
+
+# v10: pesos otimizados
+melhorou_v10 = bool(scores_pesos_otimizados.mean() < scores_3_boosters.mean())
+if melhorou_v10:
+    pred_log_v10 = prever_pesos_otimizados(pesos_otimizados_dict, X_div_train, y_div_train, X_div_test)
+    preco_v10 = np.clip(np.expm1(pred_log_v10), PRECO_MINIMO, None)
+    sub_v10 = pd.DataFrame({"Id": test_ids, "preco": preco_v10})
+    validar_formato_submissao(sub_v10, "submissao_v10.csv")
+    sub_v10.to_csv("submissao_v10.csv", index=False)
+    print(f"Submissao salva em 'submissao_v10.csv' -- pesos otimizados (RMSPE={scores_pesos_otimizados.mean():.4f}).")
+    arquivo_v10_pesos = "submissao_v10.csv"
+else:
+    print(f"Pesos otimizados (RMSPE={scores_pesos_otimizados.mean():.4f}) nao superam os 3 boosters "
+          f"(RMSPE={scores_3_boosters.mean():.4f}) -- 'submissao_v10.csv' NAO gerada.")
+    arquivo_v10_pesos = None
+
+# v11: CatBoost re-otimizado via 5-fold CV (melhoria 16) + LGBM/XGB locais, blend de 5 seeds
+if melhorou_melhoria16:
+    previsoes_v11 = []
+    for seed in seeds_submissao:
+        modelos_seed_v11 = {
+            "LGBMRegressor": LGBMRegressor(**params_lgbm_local, random_state=seed, verbose=-1),
+            "XGBRegressor": XGBRegressor(**params_xgb_local, random_state=seed, verbosity=0),
+            "CatBoostRegressor": CatBoostRegressor(**params_catboost_5fold_final, random_seed=seed, verbose=0),
+        }
+        for nome, modelo in modelos_seed_v11.items():
+            modelo.fit(X_div_train, y_div_train)
+            previsoes_v11.append(modelo.predict(X_div_test))
+    pred_log_v11 = np.mean(previsoes_v11, axis=0)
+    preco_v11 = np.clip(np.expm1(pred_log_v11), PRECO_MINIMO, None)
+    sub_v11 = pd.DataFrame({"Id": test_ids, "preco": preco_v11})
+    validar_formato_submissao(sub_v11, "submissao_v11.csv")
+    sub_v11.to_csv("submissao_v11.csv", index=False)
+    print(f"Submissao salva em 'submissao_v11.csv' -- CatBoost re-otimizado (5-fold CV) + LGBM/XGB locais, blend de 5 seeds.")
+    arquivo_v11_optuna = "submissao_v11.csv"
+else:
+    print("Melhoria 16 (Optuna direto no 5-fold CV) nao melhorou -- 'submissao_v11.csv' NAO gerada.")
+    arquivo_v11_optuna = None
+
+
+# ---------------------------------------------------------------------------
+# 64. Resumo final - diversidade de modelos
+# ---------------------------------------------------------------------------
+secao("64. RESUMO FINAL - DIVERSIDADE DE MODELOS")
+
+print("Matriz de correlacao das previsoes OOF (repetida para referencia):")
+print(matriz_correlacao.round(4).to_string())
+
+print("\nRMSPE individual de todos os 8 modelos (5-fold CV):")
+print(tab_diversos.to_string())
+
+print("\nComparacao de estrategias de ensemble (melhoria 15):")
+print(comparacao_diversidade.to_string())
+
+resumo_diversidade = pd.DataFrame(
+    [
+        {"versao": "v9 (ensemble diverso)", "rmspe_cv": rmspe_v9_candidato, "melhorou": melhorou_v9, "arquivo": arquivo_v9_diverso},
+        {"versao": "v10 (pesos otimizados)", "rmspe_cv": float(scores_pesos_otimizados.mean()), "melhorou": melhorou_v10, "arquivo": arquivo_v10_pesos},
+        {"versao": "v11 (optuna 5-fold CatBoost)", "rmspe_cv": rmspe_melhoria16, "melhorou": melhorou_melhoria16, "arquivo": arquivo_v11_optuna},
+    ]
+)
+print("\nResumo desta rodada (melhorias 14-16):")
+print(resumo_diversidade.to_string(index=False))
+
+tab_tentativas_diversidade = pd.concat([tab_tentativas_geral, resumo_diversidade], ignore_index=True)
+print("\nResumo de TODAS as tentativas do trabalho (v1-v11 + blends + diversidade):")
+print(tab_tentativas_diversidade.to_string(index=False))
+
+print("\nQuinta e ultima rodada de melhorias (diversidade) concluida.")
