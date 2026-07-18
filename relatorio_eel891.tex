@@ -123,7 +123,7 @@ A métrica de avaliação é o \textbf{RMSPE} (\textit{Root Mean Square Percenta
 
 que penaliza o erro \textbf{percentual}, não o erro absoluto: errar R\$~100 mil num imóvel de R\$~200 mil é muito pior do que errar R\$~100 mil num imóvel de R\$~2 milhões. As previsões são submetidas na plataforma Kaggle, que compara automaticamente com o gabarito oculto.
 
-O pipeline adotado segue as etapas clássicas: análise exploratória, pré-processamento (incluindo tratamento cuidadoso de \textit{outliers}), engenharia de \textit{features}, modelagem com múltiplos algoritmos, otimização bayesiana de hiperparâmetros e construção de \textit{ensembles} ponderados. As ferramentas utilizadas foram Python 3.12 com \code{pandas}~\cite{ref:pandas}, \code{scikit-learn}~\cite{ref:sklearn}, \code{LightGBM}~\cite{ref:lgbm}, \code{XGBoost}~\cite{ref:xgb}, \code{CatBoost}~\cite{ref:catboost}, \code{Optuna}~\cite{ref:optuna} e \code{SciPy}~\cite{ref:scipy}.
+O pipeline adotado segue as etapas clássicas: análise exploratória, pré-processamento (incluindo tratamento cuidadoso de \textit{outliers}), engenharia de \textit{features}, modelagem com múltiplos algoritmos, otimização bayesiana de hiperparâmetros e construção de \textit{ensembles} ponderados. As ferramentas utilizadas foram Python 3.12 com \code{pandas}~\cite{ref:pandas}, \code{scikit-learn}~\cite{ref:sklearn}, \code{LightGBM}~\cite{ref:lgbm}, \code{XGBoost}~\cite{ref:xgb}, \code{CatBoost}~\cite{ref:catboost}, \code{Optuna}~\cite{ref:optuna} e \code{SciPy}~\cite{ref:scipy}.\footnote{O código-fonte completo, incluindo todos os experimentos descritos neste relatório e o histórico de desenvolvimento, está disponível em \url{https://github.com/LuizCavalini/ML-RealEstatePricing}.}
 
 \section{Análise Exploratória dos Dados}
 

@@ -16,11 +16,12 @@ PIPELINE:
   7. Ensemble com pesos otimizados (SLSQP sobre previsões OOF)
   8. Geração da submissão
 
-NOTA: o script trabalho2_eel891.py contém a exploração completa, incluindo
-todas as abordagens testadas e descartadas descritas no relatório
-(relatorio_eel891.tex) -- LOO encoding, stacking, blending de submissões,
-feature selection, multi-seed, binning, etc. Este script contém SOMENTE o
-caminho que produziu o melhor resultado, para leitura e reprodução rápidas.
+NOTA: este script contém o pipeline final que produziu o melhor resultado.
+O processo completo de exploração — incluindo todas as abordagens testadas
+e descartadas descritas no relatório (Leave-One-Out encoding, stacking,
+blending de submissões, feature selection, busca estendida de hiperparâmetros
+com Optuna, entre outras) — está versionado em:
+https://github.com/LuizCavalini/ML-RealEstatePricing
 Os hiperparâmetros abaixo foram obtidos via Optuna (150/150/80 trials para
 LGBM/XGB/CatBoost, 25 trials para RF/ExtraTrees); o script de busca está
 em otimizacao_local.py.
