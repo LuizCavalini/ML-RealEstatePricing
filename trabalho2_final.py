@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.optimize import minimize
 from sklearn.metrics import make_scorer
 from sklearn.model_selection import KFold
 from models import (LGBMModel, XGBModel, CatBoostModel, RandomForestModel,
