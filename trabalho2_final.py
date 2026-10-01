@@ -1,3 +1,40 @@
+"""
+================================================================================
+EEL891 - Introdução ao Aprendizado de Máquina (2025-2)
+Trabalho 2 - Regressão de Preços de Imóveis (Kaggle)
+Aluno: Luiz Felipe Píccoli Cavalini
+Resultado: RMSPE 0.2393 no leaderboard público do Kaggle
+================================================================================
+
+PIPELINE:
+  1. Carregamento e EDA
+  2. Tratamento de outliers (IQR 3x + percentil 99)
+  3. Pré-processamento e imputação
+  4. Engenharia de features
+  5. Encoding (one-hot + smoothed target encoding + frequency encoding)
+  6. Modelagem: 8 modelos diversos
+  7. Ensemble com pesos otimizados (SLSQP sobre previsões OOF)
+  8. Geração da submissão
+
+NOTA: este script contém o pipeline final que produziu o melhor resultado.
+O processo completo de exploração — incluindo todas as abordagens testadas
+e descartadas descritas no relatório (Leave-One-Out encoding, stacking,
+blending de submissões, feature selection, busca estendida de hiperparâmetros
+com Optuna, entre outras) — está versionado em:
+https://github.com/LuizCavalini/ML-RealEstatePricing
+Os hiperparâmetros abaixo foram obtidos via Optuna (150/150/80 trials para
+LGBM/XGB/CatBoost, 25 trials para RF/ExtraTrees); o script de busca está
+em otimizacao_local.py.
+
+INSTALAR:
+  pip install pandas numpy matplotlib seaborn scikit-learn lightgbm xgboost \
+              catboost scipy
+
+RODAR:
+  python trabalho2_final.py
+================================================================================
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
