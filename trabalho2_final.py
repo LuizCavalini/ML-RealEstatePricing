@@ -7,14 +7,17 @@ Resultado: RMSPE 0.2393 no leaderboard público do Kaggle
 ================================================================================
 
 PIPELINE:
-  1. Carregamento e EDA
-  2. Tratamento de outliers (IQR 3x + percentil 99)
-  3. Pré-processamento e imputação
-  4. Engenharia de features
-  5. Encoding (one-hot + smoothed target encoding + frequency encoding)
-  6. Modelagem: 8 modelos diversos
-  7. Ensemble com pesos otimizados (SLSQP sobre previsões OOF)
-  8. Geração da submissão
+   1. Carregamento e EDA
+   2. Tratamento de outliers (IQR 3x + percentil 99)
+   3. Pré-processamento e imputação
+   4. Engenharia de features
+   5. Encoding (one-hot + smoothed target encoding + frequency encoding)
+   6. Métrica RMSPE
+   7. Modelos, validação cruzada (5-fold) e ensemble com pesos otimizados
+      (SLSQP sobre previsões OOF)
+   8. Geração da submissão
+   9. Feature importance (CatBoost)
+  10. Resumo final
 
 NOTA: este script contém o pipeline final que produziu o melhor resultado.
 O processo completo de exploração — incluindo todas as abordagens testadas
@@ -301,9 +304,10 @@ print("RMSPE = sqrt(mean(((preco_real - preco_previsto) / preco_real) ** 2))")
 
 
 # =============================================================================
-# 7. MODELOS (8 modelos diversos, hiperparametros ja otimizados)
+# 7. MODELOS, VALIDACAO CRUZADA E ENSEMBLE
+#    (8 modelos diversos, hiperparametros ja otimizados)
 # =============================================================================
-secao("7. MODELOS")
+secao("7. MODELOS, VALIDACAO CRUZADA E ENSEMBLE")
 
 # Hiperparametros obtidos via Optuna (ver otimizacao_local.py: 150/150/80 trials p/
 # LGBM/XGB/CatBoost, split 80/20 estratificado; RF/ExtraTrees com 25 trials).
@@ -352,6 +356,9 @@ def criar_modelos(seed=SEED):
     ]
 
 
+# WeightedEnsemble.fit() concentra o que antes eram as secoes 8 e 9: gera as
+# previsoes out-of-fold no 5-fold CV, otimiza os pesos por SLSQP e retreina
+# cada modelo no dataset completo.
 ensemble = WeightedEnsemble(criar_modelos(), metric=rmspe, cv=kf)
 tab_resultados = ensemble.fit(X_train, y_train)
 
@@ -363,9 +370,9 @@ pred_log = ensemble.predict(X_test)
 
 
 # =============================================================================
-# 10. GERACAO DA SUBMISSAO
+# 8. GERACAO DA SUBMISSAO
 # =============================================================================
-secao("10. GERACAO DA SUBMISSAO")
+secao("8. GERACAO DA SUBMISSAO")
 
 preco_previsto = np.clip(np.expm1(pred_log), PRECO_MINIMO, None)
 submissao = pd.DataFrame({"Id": test_ids, "preco": preco_previsto})
@@ -374,9 +381,9 @@ print(f"submissao_final.csv gerado: {submissao.shape[0]} linhas")
 
 
 # =============================================================================
-# 11. FEATURE IMPORTANCE
+# 9. FEATURE IMPORTANCE
 # =============================================================================
-secao("11. FEATURE IMPORTANCE (CATBOOST)")
+secao("9. FEATURE IMPORTANCE (CATBOOST)")
 
 modelo_catboost_final = ensemble.get("CatBoost").estimator
 importancias = pd.Series(modelo_catboost_final.feature_importances_, index=X_train.columns)
@@ -397,9 +404,9 @@ print("\nFigura salva em feature_importance.png")
 
 
 # =============================================================================
-# 12. RESUMO FINAL
+# 10. RESUMO FINAL
 # =============================================================================
-secao("12. RESUMO FINAL")
+secao("10. RESUMO FINAL")
 
 print(f"RMSPE do ensemble (OOF, 5-fold CV): {ensemble.oof_score(y_train):.4f}")
 print("Pesos finais:")
