@@ -1,55 +1,13 @@
-"""
-================================================================================
-EEL891 - Introdução ao Aprendizado de Máquina (2025-2)
-Trabalho 2 - Regressão de Preços de Imóveis (Kaggle)
-Aluno: Luiz Felipe Píccoli Cavalini
-Resultado: RMSPE 0.2393 no leaderboard público do Kaggle
-================================================================================
-
-PIPELINE:
-  1. Carregamento e EDA
-  2. Tratamento de outliers (IQR 3x + percentil 99)
-  3. Pré-processamento e imputação
-  4. Engenharia de features
-  5. Encoding (one-hot + smoothed target encoding + frequency encoding)
-  6. Modelagem: 8 modelos diversos
-  7. Ensemble com pesos otimizados (SLSQP sobre previsões OOF)
-  8. Geração da submissão
-
-NOTA: este script contém o pipeline final que produziu o melhor resultado.
-O processo completo de exploração — incluindo todas as abordagens testadas
-e descartadas descritas no relatório (Leave-One-Out encoding, stacking,
-blending de submissões, feature selection, busca estendida de hiperparâmetros
-com Optuna, entre outras) — está versionado em:
-https://github.com/LuizCavalini/ML-RealEstatePricing
-Os hiperparâmetros abaixo foram obtidos via Optuna (150/150/80 trials para
-LGBM/XGB/CatBoost, 25 trials para RF/ExtraTrees); o script de busca está
-em otimizacao_local.py.
-
-INSTALAR:
-  pip install pandas numpy matplotlib seaborn scikit-learn lightgbm xgboost \
-              catboost scipy
-
-RODAR:
-  python trabalho2_final.py
-================================================================================
-"""
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from catboost import CatBoostRegressor
-from lightgbm import LGBMRegressor
 from scipy.optimize import minimize
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
-from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import make_scorer
-from sklearn.model_selection import KFold, cross_val_score
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from xgboost import XGBRegressor
+from sklearn.model_selection import KFold
+from models import (LGBMModel, XGBModel, CatBoostModel, RandomForestModel,
+                    ExtraTreesModel, RidgeModel, ElasticNetModel, KNNModel)
+from ensemble import WeightedEnsemble
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 160)
@@ -345,105 +303,27 @@ KNN_N_NEIGHBORS = 10
 
 
 def criar_modelos(seed=SEED):
-    """8 modelos: 3 gradient boosters + 2 bagging + 2 lineares + 1 baseado em vizinhanca.
-
-    Diagnostico central do trabalho: os 5 modelos baseados em arvore (boosters + bagging)
-    tem correlacao >= 0.99 entre suas previsoes (todos aprendem sobre as mesmas features
-    da mesma forma), enquanto Ridge/ElasticNet/KNN sao estruturalmente diferentes e
-    correlacionam bem menos (~0.96) -- essa diversidade e o que o ensemble ponderado
-    (secao 9) explora. Lineares e KNN sao sensiveis a escala: vao dentro de um Pipeline
-    com StandardScaler, ajustado somente no treino de cada fold/fit.
-    """
-    return {
-        "LGBMRegressor": LGBMRegressor(**PARAMS_LGBM, random_state=seed, verbose=-1),
-        "XGBRegressor": XGBRegressor(**PARAMS_XGB, random_state=seed, verbosity=0),
-        "CatBoostRegressor": CatBoostRegressor(**PARAMS_CATBOOST, random_seed=seed, verbose=0),
-        "RandomForestRegressor": RandomForestRegressor(**PARAMS_RF, random_state=seed, n_jobs=1),
-        "ExtraTreesRegressor": ExtraTreesRegressor(**PARAMS_ET, random_state=seed, n_jobs=1),
-        "Ridge": Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=RIDGE_ALPHA, random_state=seed))]),
-        "ElasticNet": Pipeline([
-            ("scaler", StandardScaler()),
-            ("elasticnet", ElasticNet(alpha=ELASTICNET_ALPHA, l1_ratio=ELASTICNET_L1_RATIO, max_iter=5000, random_state=seed)),
-        ]),
-        "KNeighborsRegressor": Pipeline([("scaler", StandardScaler()), ("knn", KNeighborsRegressor(n_neighbors=KNN_N_NEIGHBORS))]),
-    }
+    return [
+        LGBMModel(PARAMS_LGBM, seed),
+        XGBModel(PARAMS_XGB, seed),
+        CatBoostModel(PARAMS_CATBOOST, seed),
+        RandomForestModel(PARAMS_RF, seed),
+        ExtraTreesModel(PARAMS_ET, seed),
+        RidgeModel({"alpha": RIDGE_ALPHA}, seed),
+        ElasticNetModel({"alpha": ELASTICNET_ALPHA, "l1_ratio": ELASTICNET_L1_RATIO,
+                         "max_iter": 5000}, seed),
+        KNNModel({"n_neighbors": KNN_N_NEIGHBORS}, seed),
+    ]
 
 
-print(f"8 modelos definidos: {list(criar_modelos().keys())}")
+ensemble = WeightedEnsemble(criar_modelos(), metric=rmspe, cv=kf)
+tab_resultados = ensemble.fit(X_train, y_train)
 
-
-# =============================================================================
-# 8. AVALIACAO 5-FOLD CV + MATRIZ DE CORRELACAO OOF
-# =============================================================================
-secao("8. AVALIACAO 5-FOLD CV E CORRELACAO OOF")
-
-
-def gerar_oof_com_scores(modelos_dict, X, y):
-    """Previsoes out-of-fold (OOF) + RMSPE por fold, numa unica passada de treino --
-    serve tanto para a tabela de RMSPE individual quanto para a matriz de correlacao."""
-    oof = {nome: np.zeros(len(X)) for nome in modelos_dict}
-    scores_por_modelo = {nome: [] for nome in modelos_dict}
-    for idx_tr, idx_val in kf.split(X):
-        X_tr, y_tr = X.iloc[idx_tr], y.iloc[idx_tr]
-        X_val, y_val = X.iloc[idx_val], y.iloc[idx_val]
-        for nome, modelo in modelos_dict.items():
-            modelo.fit(X_tr, y_tr)
-            pred = modelo.predict(X_val)
-            oof[nome][idx_val] = pred
-            scores_por_modelo[nome].append(rmspe(y_val, pred))
-    oof_df = pd.DataFrame(oof)
-    resultados = pd.DataFrame(
-        [{"modelo": nome, "rmspe_medio": np.mean(s), "rmspe_std": np.std(s)} for nome, s in scores_por_modelo.items()]
-    ).sort_values("rmspe_medio").reset_index(drop=True)
-    return oof_df, resultados
-
-
-oof_treino, tab_resultados = gerar_oof_com_scores(criar_modelos(), X_train, y_train)
-print("RMSPE individual (5-fold CV):")
 print(tab_resultados.to_string(index=False))
+print(ensemble.correlation_matrix().round(3).to_string())
+print(f"RMSPE do ensemble (OOF): {ensemble.oof_score(y_train):.4f}")
 
-matriz_correlacao = oof_treino.corr()
-print("\nMatriz de correlacao das previsoes OOF:")
-print(matriz_correlacao.round(3).to_string())
-
-
-# =============================================================================
-# 9. OTIMIZACAO DE PESOS (SLSQP sobre o OOF)
-# =============================================================================
-secao("9. OTIMIZACAO DE PESOS DO ENSEMBLE")
-
-# Blend uniforme dos 3 boosters nao superava RMSPE 0.222 em CV. Como os modelos baseados
-# em arvore sao quase perfeitamente correlacionados (secao 8), um blend uniforme com os
-# modelos diversos (mais fracos individualmente) pioraria o resultado. A solucao e
-# otimizar os PESOS do blend via scipy.optimize (SLSQP), com restricoes w>=0 e soma=1,
-# minimizando diretamente o RMSPE das previsoes OOF ponderadas -- isso permite que um
-# modelo fraco mas descorrelacionado (KNN) contribua sem dominar o ensemble.
-
-
-def objetivo_pesos(pesos, oof_matrix, y_true):
-    pred = oof_matrix.values @ pesos
-    return rmspe(y_true, pred)
-
-
-n_modelos = oof_treino.shape[1]
-pesos_iniciais = np.ones(n_modelos) / n_modelos
-restricao_soma_1 = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
-limites = [(0.0, 1.0)] * n_modelos
-
-resultado_opt = minimize(
-    objetivo_pesos, pesos_iniciais, args=(oof_treino, y_train),
-    method="SLSQP", bounds=limites, constraints=[restricao_soma_1],
-    options={"maxiter": 1000, "ftol": 1e-10},
-)
-pesos_dict = dict(zip(oof_treino.columns, resultado_opt.x))
-
-print("Pesos otimizados:")
-for nome, peso in sorted(pesos_dict.items(), key=lambda x: -x[1]):
-    print(f"  {nome:24s} peso = {peso:.4f}")
-
-pred_ensemble_oof = oof_treino.values @ resultado_opt.x
-rmspe_ensemble = rmspe(y_train, pred_ensemble_oof)
-print(f"\nRMSPE do ensemble ponderado (OOF completo): {rmspe_ensemble:.4f}")
+pred_log = ensemble.predict(X_test)
 
 
 # =============================================================================
@@ -451,31 +331,10 @@ print(f"\nRMSPE do ensemble ponderado (OOF completo): {rmspe_ensemble:.4f}")
 # =============================================================================
 secao("10. GERACAO DA SUBMISSAO")
 
-modelos_finais = criar_modelos(seed=SEED)
-previsoes_teste = {}
-for nome, modelo in modelos_finais.items():
-    modelo.fit(X_train, y_train)
-    previsoes_teste[nome] = modelo.predict(X_test)
-    print(f"  {nome:24s} treinado no dataset completo.")
-
-previsoes_teste_df = pd.DataFrame(previsoes_teste)[list(pesos_dict.keys())]
-pred_log_final = (previsoes_teste_df * pd.Series(pesos_dict)).sum(axis=1).values
-
-preco_final = np.expm1(pred_log_final)
-n_clipados = int((preco_final < PRECO_MINIMO).sum())
-preco_final = np.clip(preco_final, PRECO_MINIMO, None)
-print(f"\nPrecos abaixo de R$ {PRECO_MINIMO:,.0f} clipados: {n_clipados}")
-
-submissao = pd.DataFrame({"Id": test_ids, "preco": preco_final})
-
-exemplo = pd.read_csv(EXEMPLO_PATH)
-assert list(submissao.columns) == list(exemplo.columns), "Colunas nao batem com o exemplo!"
-assert submissao.shape[0] == exemplo.shape[0], "Numero de linhas nao bate com o exemplo!"
-assert submissao["Id"].isin(exemplo["Id"]).all(), "Ha Ids que nao existem no exemplo!"
-assert submissao["Id"].is_unique, "Ha Ids duplicados!"
-
+preco_previsto = np.clip(np.expm1(pred_log), PRECO_MINIMO, None)
+submissao = pd.DataFrame({"Id": test_ids, "preco": preco_previsto})
 submissao.to_csv("submissao_final.csv", index=False)
-print(f"Submissao salva em 'submissao_final.csv' ({len(submissao)} linhas, formato validado).")
+print(f"submissao_final.csv gerado: {submissao.shape[0]} linhas")
 
 
 # =============================================================================
@@ -483,7 +342,7 @@ print(f"Submissao salva em 'submissao_final.csv' ({len(submissao)} linhas, forma
 # =============================================================================
 secao("11. FEATURE IMPORTANCE (CATBOOST)")
 
-modelo_catboost_final = modelos_finais["CatBoostRegressor"]
+modelo_catboost_final = ensemble.get("CatBoost").estimator
 importancias = pd.Series(modelo_catboost_final.feature_importances_, index=X_train.columns)
 importancias_pct = (importancias / importancias.sum() * 100).sort_values(ascending=False)
 top20 = importancias_pct.head(20).sort_values()
@@ -506,9 +365,9 @@ print("\nFigura salva em feature_importance.png")
 # =============================================================================
 secao("12. RESUMO FINAL")
 
-print(f"RMSPE do ensemble (OOF, 5-fold CV): {rmspe_ensemble:.4f}")
+print(f"RMSPE do ensemble (OOF, 5-fold CV): {ensemble.oof_score(y_train):.4f}")
 print("Pesos finais:")
-for nome, peso in sorted(pesos_dict.items(), key=lambda x: -x[1]):
+for nome, peso in sorted(ensemble.weights.items(), key=lambda x: -x[1]):
     if peso > 1e-4:
         print(f"  {nome:24s} {peso:.4f}")
 print("Submissao final: submissao_final.csv")
