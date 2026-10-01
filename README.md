@@ -1,49 +1,52 @@
 # ML-RealEstatePricing
 
-Trabalho 2 da disciplina **EEL891 — Introdução ao Aprendizado de Máquina** (UFRJ, 2025-2).
+Assignment 2 for **EEL891 — Introduction to Machine Learning** (UFRJ, 2025-2).
 
-Regressão multivariável para estimativa de preços de imóveis residenciais, utilizando ensemble ponderado de modelos diversos com otimização bayesiana.
+Multivariable regression to estimate residential property prices, using a
+weighted ensemble of diverse models with Bayesian optimization.
 
-**Melhor resultado:** RMSPE de **0.2393** no leaderboard público do Kaggle.
+**Best result:** RMSPE of **0.2393** on the public Kaggle leaderboard.
 
-## Estrutura
-```
-├── trabalho2_eel891.py       # Pipeline completo (EDA → submissão)
-├── otimizacao_local.py       # Otimização estendida com mais trials
-├── relatorio_eel891.tex/.pdf # Relatório
-├── conjunto_de_*.csv         # Dados do Kaggle
-└── eda_*.png                 # Visualizações
-```
+## Structure
+
+├── trabalho2_eel891.py # Full pipeline (EDA → submission)
+├── otimizacao_local.py # Extended optimization with more trials
+├── relatorio_eel891.tex/.pdf # Report (Portuguese)
+├── conjunto_de_.csv # Kaggle data
+└── eda_.png # Visualizations
+
 
 ## Pipeline
 
-1. **EDA** — distribuição log-normal do preço, 20 features, correlações fracas no espaço linear
-2. **Pré-processamento** — remoção de outliers (IQR 3x + percentil 99), imputação de nulos
-3. **Feature Engineering** — área total, preço/m² estimado por bairro, interações, contagem de amenidades
-4. **Encoding** — one-hot (tipo), smoothed target encoding + frequency encoding (bairro)
-5. **Modelagem** — 8 modelos: LightGBM, XGBoost, CatBoost, RandomForest, ExtraTrees, Ridge, ElasticNet, KNN
-6. **Otimização** — Optuna bayesiano (TPE), 150/150/80 trials
-7. **Ensemble** — pesos otimizados via scipy (SLSQP) sobre previsões out-of-fold
+1. **EDA** — log-normal price distribution, 20 features, weak correlations in linear space
+2. **Preprocessing** — outlier removal (3× IQR + 99th percentile), null imputation
+3. **Feature engineering** — total area, estimated price per m² by neighbourhood, interactions, amenity count
+4. **Encoding** — one-hot (property type), smoothed target encoding + frequency encoding (neighbourhood)
+5. **Modelling** — 8 models: LightGBM, XGBoost, CatBoost, RandomForest, ExtraTrees, Ridge, ElasticNet, KNN
+6. **Optimization** — Bayesian Optuna (TPE), 150/150/80 trials
+7. **Ensemble** — weights optimized with scipy (SLSQP) over out-of-fold predictions
 
-## Resultados
+## Results
 
-| Versão | RMSPE Kaggle |
+| Version | Kaggle RMSPE |
 |---|---|
 | Baseline | 0.2535 |
-| + encoding, features, outliers | 0.2479 |
-| + re-otimização Optuna | 0.2469 |
-| + Optuna estendido (mais trials) | 0.2437 |
-| **+ ensemble ponderado diverso** | **0.2393** |
+| + encoding, features, outlier removal | 0.2479 |
+| + Optuna re-tuning | 0.2469 |
+| + extended Optuna (more trials) | 0.2437 |
+| **+ weighted diverse ensemble** | **0.2393** |
 
-**Achado principal:** ensembles de gradient boosting apresentaram correlação >0.998 entre si, limitando o ganho de blending uniforme. A adição de modelos estruturalmente diferentes (KNN) com pesos otimizados quebrou esse teto.
+**Main finding:** the gradient boosting models correlated above 0.998 with
+each other, capping the gain from uniform blending. Adding structurally
+different models (KNN) with optimized weights broke that ceiling.
 
-## Como Executar
+## Running
 
 ```bash
 pip install pandas numpy matplotlib seaborn scikit-learn lightgbm xgboost catboost optuna scipy
 python trabalho2_eel891.py
 ```
 
-## Autor
+## Author
 
-**Luiz Felipe Píccoli Cavalini** — Engenharia de Computação e Informação, UFRJ
+**Luiz Felipe Píccoli Cavalini** — Computer and Information Engineering, UFRJ
